@@ -1,4 +1,4 @@
-# CLAUDE.md — moto-ml
+# CLAUDE.md — vehicle-ml
 
 @.claude/PLATFORM-RULES.md
 
@@ -22,7 +22,7 @@ Offline model **training** (Python): context classification (first model: road t
 
 ## Dependencies
 
-`external/moto-vehicle-defs` (signal names), data comes from `moto-server` (Parquet).
+`external/vehicle-defs` (signal names), data comes from `vehicle-server` (Parquet).
 
 ## Build
 
@@ -30,4 +30,4 @@ Offline model **training** (Python): context classification (first model: road t
 
 ## Context
 
-`../moto-vehicle-defs/docs/hardware-architecture.md` §5b.0, §5b.9 · `../moto-vehicle-defs/docs/phase0-data-collection-plan.md`.
+`../vehicle-defs/docs/hardware-architecture.md` §5b.0, §5b.9 · `../vehicle-defs/docs/phase0-data-collection-plan.md`.
