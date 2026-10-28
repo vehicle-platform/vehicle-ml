@@ -1,10 +1,10 @@
 ---
 name: repo-bootstrap
-description: Scaffold a moto-platform repo with the standard layout, build system, tests, CI and the moto-vehicle-defs submodule. Use when starting code in a repo that only has README/CLAUDE.md, e.g. "/repo-bootstrap moto-rt-core", "set up moto-hil-bench host".
+description: Scaffold a vehicle-platform repo with the standard layout, build system, tests, CI and the vehicle-defs submodule. Use when starting code in a repo that only has README/CLAUDE.md, e.g. "/repo-bootstrap vehicle-rt-core", "set up vehicle-hil-bench host".
 argument-hint: <repo-name> [part]
 ---
 
-<!-- Synced from moto-workspace/.claude/skills/repo-bootstrap/SKILL.md by scripts/sync_claude.py. Do not edit here; edit the source and re-run the sync. -->
+<!-- Synced from vehicle-workspace/.claude/skills/repo-bootstrap/SKILL.md by scripts/sync_claude.py. Do not edit here; edit the source and re-run the sync. -->
 
 # Repo bootstrap
 
@@ -12,16 +12,16 @@ Read the target repo's `CLAUDE.md` first; its scope and module list drive the sk
 
 ## Common to every repo
 
-- `README.md` (English): purpose, place in the platform (link to the org), build/test commands, license line "MIT, see LICENSE (D-036)". Add the MIT `LICENSE` ("Copyright (c) 2026 The moto-platform authors").
+- `README.md` (English): purpose, place in the platform (link to the org), build/test commands, license line "MIT, see LICENSE (D-036)". Add the MIT `LICENSE` ("Copyright (c) 2026 The vehicle-platform authors").
 - Version `0.1.0` in the build file (CMake `project(VERSION)`, `pyproject.toml`, `pubspec.yaml`); releases follow PLATFORM-RULES "Releases" (D-036).
 - `.gitignore` suited to the toolchain, `.editorconfig`.
-- Submodule, using a **relative URL** so it survives the move from the personal account to the `moto-platform` org:
+- Submodule, using a **relative URL** so it survives the move from the personal account to the `vehicle-platform` org:
   ```bash
-  git submodule add ../moto-vehicle-defs.git external/moto-vehicle-defs
-  git -C external/moto-vehicle-defs checkout <tag>   # always a tag (the one in manifest.yaml), never main
+  git submodule add ../vehicle-defs.git external/vehicle-defs
+  git -C external/vehicle-defs checkout <tag>   # always a tag (the one in manifest.yaml), never main
   ```
-  (moto-vehicle-defs itself and moto-mobile skip the submodule unless needed.)
-- CI: `.github/workflows/ci.yml` with `submodules: recursive` checkout, build + L0 tests + static analysis, and a step that fails unless the defs pin is a semver release tag `vX.Y.Z` (fetch the tags first, the checkout is shallow; copy the step from moto-rt-core `ci.yml`).
+  (vehicle-defs itself and vehicle-mobile skip the submodule unless needed.)
+- CI: `.github/workflows/ci.yml` with `submodules: recursive` checkout, build + L0 tests + static analysis, and a step that fails unless the defs pin is a semver release tag `vX.Y.Z` (fetch the tags first, the checkout is shallow; copy the step from vehicle-rt-core `ci.yml`).
 - Keep the skeleton minimal: empty module folders get a short `README.md` stating responsibility; no speculative code.
 
 ## Type: STM32 firmware (rt-core = STM32H755 Cortex-M7, safety-node = its Cortex-M4 (D-072), hil-bench/simulator)
@@ -36,7 +36,7 @@ src/services/               # signal pool, com (gen pack/unpack + E2E), diag (UD
 src/features/<module>/      # one folder per feature from CLAUDE.md; no cross-includes
 src/app/main_app.c          # task/loop setup, called from cubemx USER CODE
 tests/host/                 # Unity (FetchContent), ctest; tests of HAL-free logic
-external/moto-vehicle-defs/ # submodule; include gen/c/<node>/ only
+external/vehicle-defs/ # submodule; include gen/c/<node>/ only
 .clang-format, .clang-tidy, cppcheck suppressions (MISRA addon)
 ```
 - Compile flags: `-Wall -Wextra -Werror -Wshadow -Wconversion`, no heap on safety nodes (`-Wl,--wrap=malloc` to catch use, or no heap region).
@@ -45,13 +45,13 @@ external/moto-vehicle-defs/ # submodule; include gen/c/<node>/ only
 
 ## Type: ESP-IDF (connectivity-node)
 
-`CMakeLists.txt`, `sdkconfig.defaults` (target esp32s3), `main/`, `components/<module>/` (bridge, voice (esp-sr), wifi_sync, ble, platform_can), `test/` (Unity host tests where possible), `external/moto-vehicle-defs`. CI: `espressif/esp-idf-ci-action`.
+`CMakeLists.txt`, `sdkconfig.defaults` (target esp32s3), `main/`, `components/<module>/` (bridge, voice (esp-sr), wifi_sync, ble, platform_can), `test/` (Unity host tests where possible), `external/vehicle-defs`. CI: `espressif/esp-idf-ci-action`.
 
 ## Type: Python (hil-bench/host, linux-node, server, ml, mcp, defs tools)
 
 `uv init --package` → `pyproject.toml` (Python ≥3.11, ruff + pytest + mypy in dev group), `src/<package>/`, `tests/`, `uv.lock`. CI: `astral-sh/setup-uv`, `uv run ruff check`, `uv run pytest`. CAN code uses `python-can` + `cantools`, and tests run on `vcan` or python-can's virtual bus, never real hardware.
 
-## Type: moto-vehicle-defs
+## Type: vehicle-defs
 
 ```
 uds/vehicle_cl250.yaml  dbc/cl250.dbc (skeleton)  dbc/platform.dbc  vss/overlay.vspec  uds/dids.yaml
@@ -61,7 +61,7 @@ Makefile (gen, check)   CHANGELOG.md   docs/
 ```
 CI: parse DBCs strictly, run `make gen` and fail if `git diff --exit-code gen/` shows drift. Seed `platform.dbc` with node definitions, the attribute definitions from `/signal-change`, and heartbeat messages `0x081-0x085`.
 
-## Type: Flutter (moto-mobile)
+## Type: Flutter (vehicle-mobile)
 
 Flutter (D-022). Port the legacy `HondaCl250_Telemetry/mobile_app/flutter_app` per D-023 instead of `flutter create` from scratch.
 
