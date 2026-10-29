@@ -17,7 +17,7 @@ You are an AI coding tool (Codex, Gemini, DeepSeek, Cursor, Aider, Copilot, …)
 - **yellow** — allowed; the PR needs a Claude review before the user merges it (write `needs-claude-review` in the PR description).
 - **green** — allowed; still log it.
 
-- **All repos (checked first)** — red: `.claude/*`, `AGENTS.md`, `GEMINI.md`, `CLAUDE.md`, `.github/*`, `external/vehicle-defs`, `external/*`, `gen/*`, `*/gen/*`, `misra/*`
+- **All repos (checked first)** — red: `.claude/*`, `AGENTS.md`, `GEMINI.md`, `CLAUDE.md`, `.github/*`, `external/vehicle-defs`, `external/*`, `gen/*`, `*/gen/*`, `misra/*`; yellow: `pyproject.toml`, `*/pyproject.toml`, `pubspec.yaml`, `package.json`, `Cargo.toml`, `*/Cargo.toml`
 - **vehicle-workspace** — red: `external-ai/log/TEMPLATE.md`, `external-ai/*`, `PLATFORM-RULES.md`, `manifest.yaml`, `scripts/*`, `setup.sh`; yellow: `STATUS.md`, `ISSUES.md`; green: `external-ai/log/*`; everything else: **yellow**
 - **vehicle-defs** — red: `docs/DECISIONS.md`, `docs/ARCHITECTURE.md`; yellow: `docs/*`; green: `docs/ideas/*`; everything else: **red**
 - **vehicle-safety-node** — everything: **red**
@@ -26,7 +26,7 @@ You are an AI coding tool (Codex, Gemini, DeepSeek, Cursor, Aider, Copilot, …)
 - **vehicle-connectivity-node** — red: `src/HondaCANModule*`, `src/DiscoveryScan*`, `src/IsoTp*`, `src/TesterLatch*`, `src/CanCapture*`, `src/hal/Twai*`, `src/hal/RtcTesterLatchStore*`, `platformio.ini`; yellow: `src/Gps*`; everything else: **yellow**
 - **vehicle-hil-bench** — red: `*fault*`; everything else: **yellow**
 - **vehicle-linux-node** — red: `*ota*`; everything else: **yellow**
-- **vehicle-server** — red: `*ota*`; yellow: `*gps*`, `*position*`; everything else: **green**
+- **vehicle-server** — red: `*ota*`; yellow: `*mdf4*`, `*gps*`, `*position*`; everything else: **green**
 - **vehicle-mobile** — yellow: `lib/services/session_upload*`, `lib/services/upload_client*`; everything else: **green**
 - **vehicle-analyzer** — red: `src/services/webSerialCan*`, `src/services/udsComposer*`, `src-tauri/*`; yellow: `src/defs/*`; everything else: **green**
 - **vehicle-mcp** — everything: **yellow**
