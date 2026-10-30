@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from vehicle_ml.features import IDENTITY_COLUMNS
+
 
 @dataclass
 class Standardizer:
@@ -20,16 +22,24 @@ class Standardizer:
     def fit(
         cls,
         train_features: pd.DataFrame,
-        split_manifest: Mapping[str, Sequence[str]] | None = None,
+        split_manifest: Mapping[str, Sequence[str]],
     ) -> Standardizer:
-        """Fit on train rows; reject rows whose session is not in the train split."""
-        if split_manifest is not None and "session_id" in train_features.columns:
-            train_ids = set(split_manifest.get("train", ()))
-            leaked = sorted(set(train_features["session_id"].astype(str)) - train_ids)
-            if leaked:
-                raise ValueError(f"rows from non-train sessions: {', '.join(leaked)}")
+        """Fit on train rows; reject rows whose session is not in the train split.
 
-        numeric = train_features.select_dtypes(include=[np.number])
+        Needs a ``session_id`` column. Window identity columns and ``split`` are not
+        features and are never fitted.
+        """
+        if "session_id" not in train_features.columns:
+            raise ValueError("train_features needs a session_id column")
+        train_ids = set(split_manifest.get("train", ()))
+        leaked = sorted(set(train_features["session_id"].astype(str)) - train_ids)
+        if leaked:
+            raise ValueError(f"rows from non-train sessions: {', '.join(leaked)}")
+
+        skipped = {*IDENTITY_COLUMNS, "split"}
+        numeric = train_features.select_dtypes(include=[np.number]).drop(
+            columns=[c for c in train_features.columns if c in skipped], errors="ignore"
+        )
         means: dict[str, float] = {}
         stds: dict[str, float] = {}
         constant: list[str] = []

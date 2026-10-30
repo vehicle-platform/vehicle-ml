@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from vehicle_ml.features import STATS, features_frame, window_features
-from vehicle_ml.windows import Window
+from vehicle_ml.features import STATS, RateError, features_frame, window_features
+from vehicle_ml.windows import DropReport, Window
 
 
 def _window(values: list[float], step_ms: int = 100) -> Window:
@@ -82,3 +82,41 @@ def test_features_frame_has_one_row_per_window() -> None:
     assert len(frame) == 2
     assert list(frame.columns[:3]) == ["session_id", "start_ms", "end_ms"]
     assert "engine_speed_rpm.mean" in frame.columns
+
+
+def _uneven_window() -> Window:
+    return Window(
+        session_id="s1",
+        start_ms=0,
+        end_ms=300,
+        times_ms=np.asarray([0, 100, 250, 300]),
+        channels={"engine_speed_rpm": np.asarray([1.0, 2.0, 3.0, 4.0])},
+    )
+
+
+def test_features_frame_skips_uneven_rate_windows_and_reports_them() -> None:
+    bands = {"engine_speed_rpm": [(1.0, 5.0)]}
+    report = DropReport(candidates=2, kept=2)
+    with pytest.raises(RateError):
+        window_features(_uneven_window(), bands)
+    frame = features_frame([_uneven_window(), _window([1.0, 2.0, 3.0, 4.0])], bands, report=report)
+    assert len(frame) == 1
+    assert report.dropped == {"rate": 1}
+    assert report.kept == 1
+
+
+def test_band_energy_ignores_dc_offset_and_nan_fill() -> None:
+    times = np.arange(0, 1000, 10)
+    wave = np.sin(2 * np.pi * 10.0 * times / 1000.0)
+    bands = {"engine_speed_rpm": [(0.0, 3.0), (8.0, 12.0)]}
+
+    def energy(values: np.ndarray) -> dict[str, float | int | None]:
+        window = Window("s1", 0, 990, times, {"engine_speed_rpm": values})
+        return window_features(window, bands=bands)
+
+    shifted = energy(wave + 1000.0)
+    assert shifted["engine_speed_rpm.band_0_3hz"] == pytest.approx(0.0, abs=1e-6)
+    assert shifted["engine_speed_rpm.band_8_12hz"] > 1.0
+    holed = wave.copy()
+    holed[5] = np.nan
+    assert energy(holed)["engine_speed_rpm.band_0_3hz"] < 1.0

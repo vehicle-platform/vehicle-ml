@@ -16,10 +16,23 @@ from vehicle_ml.data.store import KINDS, SessionStore
 from vehicle_ml.features import features_frame
 from vehicle_ml.normalize import Standardizer
 from vehicle_ml.split import PARTS, split_sessions
-from vehicle_ml.windows import DropReport, align_frames, make_windows
+from vehicle_ml.windows import TIME_COLUMN, DropReport, align_frames, make_windows
 
 FRACTIONS: tuple[float, float, float] = (0.7, 0.15, 0.15)
-TIME_COLUMN = "device_time_ms"
+
+# Version 4 tester statistics (vehicle-server decode.V4_EXTRA_HEADER).
+_TESTER_STATS = frozenset(
+    {
+        "step_gap_max_ms",
+        "step_gap_over_count",
+        "rtt_did",
+        "rtt_min_ms",
+        "rtt_max_ms",
+        "rtt_sum_ms",
+        "rtt_count",
+        "rtt_nrc78_count",
+    }
+)
 
 # Columns that describe the storage, not a measured channel (vehicle-server/README.md
 # "Storage layout"). They are skipped by --channels all and may still be requested by name.
@@ -51,6 +64,24 @@ _METADATA_COLUMNS = frozenset(
 )
 
 
+def _is_metadata(name: str) -> bool:
+    """True for columns --channels all skips; an explicit name still selects them.
+
+    Beyond the exact names above, rules cover the server's per-signal and health
+    columns: ``<signal>_age_ms`` / ``<signal>_valid`` (vehicle-server parquet.py
+    telemetry docstring), ``can_*`` and ``unanswered_did_count`` (version 3 CAN health,
+    vehicle-server decode.CAN_HEALTH_FIELDS) and the version 4 tester statistics
+    (vehicle-server decode.V4_EXTRA_HEADER).
+    """
+    return (
+        name in _METADATA_COLUMNS
+        or name in _TESTER_STATS
+        or name.endswith(("_age_ms", "_valid"))
+        or name.startswith("can_")
+        or name == "unanswered_did_count"
+    )
+
+
 @dataclass
 class DatasetResult:
     features: pd.DataFrame
@@ -60,9 +91,23 @@ class DatasetResult:
     drops: dict[str, int] = field(default_factory=dict)
     channels: dict[str, list[str]] = field(default_factory=dict)
     defs_versions: dict[str, str | None] = field(default_factory=dict)
+    excluded: set[str] = field(default_factory=set)
+    base_kinds: dict[str, int] = field(default_factory=dict)
 
 
-def _wide(frame: pd.DataFrame, kind: str, requested: Sequence[str] | None) -> pd.DataFrame:
+@dataclass
+class _SessionData:
+    frame: pd.DataFrame
+    report: DropReport
+    channels: dict[str, list[str]] = field(default_factory=dict)
+    excluded: set[str] = field(default_factory=set)
+    base_kind: str | None = None
+
+
+def _wide(
+    frame: pd.DataFrame, kind: str, requested: Sequence[str] | None
+) -> tuple[pd.DataFrame, set[str]]:
+    """Wide numeric frame plus the columns ``--channels all`` auto-excluded."""
     if kind == "derived":
         frame = frame.pivot_table(
             index=["session_id", TIME_COLUMN],
@@ -71,30 +116,33 @@ def _wide(frame: pd.DataFrame, kind: str, requested: Sequence[str] | None) -> pd
             aggfunc="last",
         ).reset_index()
         frame.columns.name = None
+    excluded: set[str] = set()
     if requested is None:
-        columns = [
-            str(column)
-            for column in frame.columns
-            if column not in _METADATA_COLUMNS and pd.api.types.is_numeric_dtype(frame[column])
+        numeric = [
+            str(column) for column in frame.columns if pd.api.types.is_numeric_dtype(frame[column])
         ]
+        excluded = {column for column in numeric if _is_metadata(column)}
+        columns = [column for column in numeric if column not in excluded]
     else:
         columns = [column for column in requested if column in frame.columns]
     identity = [column for column in ("session_id", TIME_COLUMN) if column in frame.columns]
-    return frame[[*identity, *columns]]
+    return frame[[*identity, *columns]], excluded
 
 
 def _kind_frames(
     store: SessionStore, session_id: str, kinds: Sequence[str], requested: Sequence[str] | None
-) -> dict[str, pd.DataFrame]:
+) -> tuple[dict[str, pd.DataFrame], set[str]]:
     frames: dict[str, pd.DataFrame] = {}
+    excluded: set[str] = set()
     for kind in kinds:
         frame = store.load(session_id, kind)
         if frame is None or frame.empty:
             continue
-        wide = _wide(frame, kind, requested)
+        wide, skipped = _wide(frame, kind, requested)
+        excluded |= skipped
         if len(wide.columns) > (1 if "session_id" in wide.columns else 0) + 1:
             frames[kind] = wide
-    return frames
+    return frames, excluded
 
 
 def _session_windows(
@@ -106,19 +154,19 @@ def _session_windows(
     stride_ms: int,
     max_gap_ms: int,
     bands: Mapping[str, Sequence[tuple[float, float]]],
-) -> tuple[pd.DataFrame, DropReport, dict[str, list[str]]]:
-    frames = _kind_frames(store, session_id, kinds, channels)
+) -> _SessionData:
+    frames, excluded = _kind_frames(store, session_id, kinds, channels)
     if not frames:
-        report = DropReport(candidates=0, kept=0, dropped={"missing": 1})
-        return pd.DataFrame(), report, {}
+        report = DropReport(candidates=0, kept=0, dropped={"no_data": 1})
+        return _SessionData(pd.DataFrame(), report, excluded=excluded)
 
-    base_kind = max(frames, key=lambda kind: len(frames[kind]))
+    # Time base: the kind with the most rows; ties go to the earlier kind in KINDS.
+    base_kind = max(frames, key=lambda kind: (len(frames[kind]), -KINDS.index(kind)))
     base = frames[base_kind]
     combined = base.copy()
     used_channels = [
         str(column) for column in base.columns if column not in {"session_id", TIME_COLUMN}
     ]
-    used_channels = list(dict.fromkeys(used_channels))
     channels_by_kind = {base_kind: list(used_channels)}
 
     for kind, frame in frames.items():
@@ -144,9 +192,8 @@ def _session_windows(
         stride_ms=stride_ms,
         max_gap_ms=max_gap_ms,
     )
-    if not windows:
-        return pd.DataFrame(), report, channels_by_kind
-    return features_frame(windows, bands), report, channels_by_kind
+    frame = features_frame(windows, bands, report=report) if windows else pd.DataFrame()
+    return _SessionData(frame, report, channels_by_kind, excluded, base_kind)
 
 
 def _defs_version(session_dir: Path) -> str | None:
@@ -191,9 +238,11 @@ def build_dataset(
     rows: list[pd.DataFrame] = []
     drops: dict[str, int] = {}
     used_channels: dict[str, set[str]] = {kind: set() for kind in kinds}
+    excluded: set[str] = set()
+    base_kinds: dict[str, int] = {}
     defs_versions: dict[str, str | None] = {}
     for session_id in ids:
-        frame, report, session_channels = _session_windows(
+        session = _session_windows(
             store,
             session_id,
             kinds,
@@ -203,14 +252,17 @@ def build_dataset(
             max_gap_ms,
             bands or {},
         )
-        for reason, count in report.dropped.items():
+        for reason, count in session.report.dropped.items():
             drops[reason] = drops.get(reason, 0) + count
-        for kind, names in session_channels.items():
-            used_channels.setdefault(kind, set()).update(names)
+        for kind, names in session.channels.items():
+            used_channels[kind].update(names)
+        excluded |= session.excluded
+        if session.base_kind is not None:
+            base_kinds[session.base_kind] = base_kinds.get(session.base_kind, 0) + 1
         defs_versions[session_id] = _defs_version(data / "sessions" / session_id)
-        if not frame.empty:
-            frame["split"] = split_of[session_id]
-            rows.append(frame)
+        if not session.frame.empty:
+            session.frame["split"] = split_of[session_id]
+            rows.append(session.frame)
 
     if not any(used_channels.values()):
         raise ValueError("no requested channels found in the data")
@@ -229,6 +281,8 @@ def build_dataset(
         drops=drops,
         channels={kind: sorted(names) for kind, names in used_channels.items() if names},
         defs_versions=defs_versions,
+        excluded=excluded,
+        base_kinds=base_kinds,
     )
 
 
@@ -256,6 +310,25 @@ def _dataset_card(result: DatasetResult, sessions: pd.DataFrame, kinds: Sequence
     for kind in kinds:
         names = result.channels.get(kind, [])
         lines.append(f"- **{kind}**: {', '.join(names) if names else '(none)'}")
+    if result.excluded:
+        lines += [
+            "",
+            "Auto-excluded by `--channels all` (storage metadata, per-signal age/validity, "
+            "CAN health, tester statistics): " + ", ".join(sorted(result.excluded)),
+        ]
+    lines += [
+        "",
+        "## Time base",
+        "",
+        "Time base per session: the kind with the most rows; other kinds are "
+        "nearest-previous aligned within max_gap_ms.",
+        "",
+        "| base kind | sessions |",
+        "|---|---|",
+    ]
+    for kind in KINDS:
+        if kind in result.base_kinds:
+            lines.append(f"| {kind} | {result.base_kinds[kind]} |")
     lines += [
         "",
         "## Modality availability",
