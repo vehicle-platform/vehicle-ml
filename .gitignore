@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
-data/
-out/
+/data/
+/out/
 *.parquet
 !tests/**/*.parquet
