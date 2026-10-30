@@ -1,0 +1,36 @@
+[project]
+name = "vehicle-ml"
+version = "0.1.0"
+description = "Offline data layer and training for vehicle-platform models (D-010)."
+readme = "README.md"
+authors = [{ name = "vehicle-platform" }]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pyarrow>=17.0",
+]
+
+[project.scripts]
+vehicle-ml = "vehicle_ml.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8.17,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["external"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
