@@ -57,6 +57,7 @@ Rules enforced by the code:
 ## Build
 
 ```sh
+git submodule update --init --recursive   # external/vehicle-defs, pinned to v0.20.0
 uv sync
 uv run pytest
 uv run ruff check .
