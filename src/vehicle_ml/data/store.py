@@ -58,9 +58,7 @@ class SessionStore:
     def sessions(self) -> pd.DataFrame:
         """The session index: one row per ingested session."""
         with closing(self._connect()) as conn:
-            frame = pd.read_sql_query(
-                f"SELECT {', '.join(_SESSION_COLUMNS)} FROM sessions", conn
-            )
+            frame = pd.read_sql_query(f"SELECT {', '.join(_SESSION_COLUMNS)} FROM sessions", conn)
         for column in ("has_imu", "has_gps", "has_vehicle_signals", "has_derived"):
             frame[column] = frame[column].astype(bool)
         return frame
