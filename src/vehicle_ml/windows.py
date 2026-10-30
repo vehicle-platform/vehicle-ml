@@ -22,6 +22,7 @@ class Window:
     session_id: str
     start_ms: int
     end_ms: int
+    times_ms: np.ndarray
     channels: dict[str, np.ndarray]
 
 
@@ -113,7 +114,15 @@ def make_windows(
             report.drop(reason)
             continue
 
-        windows.append(Window(session_id=session_id, start_ms=start, end_ms=end, channels=values))
+        windows.append(
+            Window(
+                session_id=session_id,
+                start_ms=start,
+                end_ms=end,
+                times_ms=window_times,
+                channels=values,
+            )
+        )
 
     report.kept = len(windows)
     return windows, report
