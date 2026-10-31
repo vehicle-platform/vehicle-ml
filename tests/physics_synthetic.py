@@ -170,9 +170,7 @@ def _operating_point(spec: PhysicsSessionSpec, times: np.ndarray) -> tuple[np.nd
         )
     rpm = np.clip(rpm, 800.0, 8000.0)
     speed = np.clip(speed, 0.0, 120.0)
-    throttle = np.clip(
-        20.0 + 40.0 * spec.load + 10.0 * np.sin(2.0 * np.pi * 0.07 * seconds), 0, 100
-    )
+    throttle = np.clip(5.0 + 35.0 * spec.load + 20.0 * np.sin(2.0 * np.pi * 0.07 * seconds), 0, 100)
     return rpm, speed, throttle
 
 
