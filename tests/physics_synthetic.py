@@ -4,7 +4,8 @@ The generated sessions use the same lumped equations as the stage-1 estimators:
 
 - cooling: ``dT/dt = a * q(rpm) - h_eff * (T - T_amb)`` with ``q = rpm / 6000``;
 - charging: a piecewise-linear voltage with a slope below the cut-in RPM and a plateau;
-- gearing: one measured ratio per gear, with an optional clutch-slip multiplier.
+- gearing: one measured ratio per gear (the defs ``gear_ratio_<n>`` constants), with an
+  optional clutch-slip multiplier.
 
 The files mirror the vehicle-server storage layout used by ``tests/synthetic.py``.
 Every value is synthetic; no real ride data or position is written. A fault changes
@@ -23,6 +24,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from vehicle_ml.defs import vehicle_constants
+
 BASE_UTC = datetime(2026, 10, 15, 9, 0, 0, tzinfo=UTC)
 DEFS_VERSION = "0.20.0"
 STEP_MS = 100
@@ -34,8 +37,13 @@ FAULT_KINDS = (
     "clutch_slip",
 )
 
-GEAR_RATIOS = (3.0, 2.1, 1.6, 1.3, 1.1, 0.95)
-GEAR_THRESHOLDS_KMH = (15.0, 30.0, 45.0, 60.0, 80.0)
+# The gearbox ratios come from defs (invariant 2); only the speed bands are synthetic,
+# one per gear so every gear appears at the generated speeds (at most ~70 km/h).
+GEAR_RATIOS = tuple(
+    vehicle_constants.CONSTANTS[f"gear_ratio_{number}"][0]
+    for number in range(1, int(vehicle_constants.CONSTANTS["gear_count"][0]) + 1)
+)
+GEAR_THRESHOLDS_KMH = (15.0, 25.0, 35.0, 45.0, 55.0, 65.0)
 
 
 @dataclass(frozen=True)
