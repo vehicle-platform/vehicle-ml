@@ -936,15 +936,105 @@ def _seed_metrics(data: Mapping[str, object]) -> dict[str, float]:
         metrics[f"{model}.false_alarms_per_hour"] = float(test["false_alarms"]["per_hour"])
         for kind, fault in test["faults"].items():
             sessions = int(fault["sessions"])
+            not_evaluated = int(fault.get("not_evaluated", 0))
+            evaluated = sessions - not_evaluated
             prefix = f"{model}.{kind}"
-            metrics[f"{prefix}.detection_rate"] = fault["detected"] / sessions
+            metrics[f"{prefix}.detection_rate"] = (
+                fault["detected"] / evaluated if evaluated else 0.0
+            )
+            metrics[f"{prefix}.not_evaluated_rate"] = not_evaluated / sessions if sessions else 0.0
             if fault["median_delay_ms"] is not None:
                 metrics[f"{prefix}.median_delay_ms"] = float(fault["median_delay_ms"])
             if fault["first_alarm_matches_expected"] is not None:
                 metrics[f"{prefix}.first_alarm_expected_rate"] = (
-                    fault["first_alarm_matches_expected"] / sessions
+                    fault["first_alarm_matches_expected"] / evaluated if evaluated else 0.0
                 )
     return metrics
+
+
+def _seed_first_alarm_modality(fault: Mapping[str, object]) -> str:
+    """One value per seed: the first-alarm modality, ``no alarm`` or ``not evaluated``.
+
+    A fault kind can have several test sessions in one seed. If their first alarms all
+    agree, that modality is used; if they disagree, the seed is ``mixed``.
+    """
+    sessions = int(fault.get("sessions", 0))
+    detected = int(fault.get("detected", 0))
+    not_evaluated = int(fault.get("not_evaluated", 0))
+    if detected == 0:
+        if sessions > 0 and not_evaluated == sessions:
+            return "not evaluated"
+        return "no alarm"
+    modalities = fault.get("first_alarm_modalities", {})
+    if not isinstance(modalities, Mapping):
+        raise ValueError("first_alarm_modalities must be an object")
+    names = sorted(str(name) for name, count in modalities.items() if int(count) > 0)
+    if len(names) == 1:
+        return names[0]
+    return "mixed"
+
+
+def aggregate_attribution(
+    per_seed: Mapping[int, Mapping[str, object]],
+) -> dict[str, dict[str, dict[str, object]]]:
+    """First-alarm modality stability per model and fault kind over the seeds.
+
+    ``first_alarm_modalities`` has one entry per seed that has the fault kind in its test
+    split. A seed with no alarm is ``no alarm`` (not a mismatch); an all-unscored seed is
+    ``not evaluated``. ``fraction_matching_expected`` divides matching seeds by all seeds
+    with the fault kind, or is ``None`` when the ground truth has no expected modality.
+    """
+    collected: dict[str, dict[str, dict[str, object]]] = {}
+    for seed in sorted(per_seed):
+        data = per_seed[seed]
+        for model, entry in data["models"].items():
+            for kind, fault in entry["test"]["faults"].items():
+                bucket = collected.setdefault(model, {}).setdefault(
+                    kind,
+                    {
+                        "expected_modality": fault.get("expected_modality"),
+                        "seeds": [],
+                        "first_alarm_modalities": [],
+                        "matches_expected": 0,
+                        "no_alarm_seeds": 0,
+                        "not_evaluated_seeds": 0,
+                        "mixed_seeds": 0,
+                    },
+                )
+                modality = _seed_first_alarm_modality(fault)
+                bucket["seeds"].append(int(seed))
+                bucket["first_alarm_modalities"].append(modality)
+                if modality == "no alarm":
+                    bucket["no_alarm_seeds"] = int(bucket["no_alarm_seeds"]) + 1
+                elif modality == "not evaluated":
+                    bucket["not_evaluated_seeds"] = int(bucket["not_evaluated_seeds"]) + 1
+                elif modality == "mixed":
+                    bucket["mixed_seeds"] = int(bucket["mixed_seeds"]) + 1
+                if (
+                    bucket["expected_modality"] is not None
+                    and modality == bucket["expected_modality"]
+                ):
+                    bucket["matches_expected"] = int(bucket["matches_expected"]) + 1
+
+    result: dict[str, dict[str, dict[str, object]]] = {}
+    for model, kinds in sorted(collected.items()):
+        result[model] = {}
+        for kind, bucket in sorted(kinds.items()):
+            seeds = [int(seed) for seed in bucket["seeds"]]
+            expected = bucket["expected_modality"]
+            result[model][kind] = {
+                "expected_modality": expected,
+                "seeds": seeds,
+                "first_alarm_modalities": list(bucket["first_alarm_modalities"]),
+                "matches_expected": int(bucket["matches_expected"]),
+                "fraction_matching_expected": (
+                    int(bucket["matches_expected"]) / len(seeds) if expected is not None else None
+                ),
+                "no_alarm_seeds": int(bucket["no_alarm_seeds"]),
+                "not_evaluated_seeds": int(bucket["not_evaluated_seeds"]),
+                "mixed_seeds": int(bucket["mixed_seeds"]),
+            }
+    return result
 
 
 def aggregate_metrics(per_seed: Mapping[int, Mapping[str, object]]) -> dict[str, dict[str, float]]:
@@ -992,6 +1082,38 @@ def _aggregate_markdown(data: Mapping[str, object]) -> str:
             f"| {name} | {stats['n_seeds']} | {stats['mean']:.6g} | {stats['min']:.6g} | "
             f"{stats['max']:.6g} |"
         )
+    lines += [
+        "",
+        "## Attribution stability",
+        "",
+        "One entry per seed that has the fault kind in its test split. `no alarm` is not a "
+        "mismatch; `not evaluated` means every window was unscored; `mixed` means the "
+        "seed's test sessions disagreed on the first-alarm modality.",
+        "",
+        "| model | fault kind | expected modality | first alarm modality per seed "
+        "| matching seeds | fraction |",
+        "|---|---|---|---|---|---|",
+    ]
+    attribution = data.get("attribution", {})
+    if not attribution:
+        lines.append("| (none) | - | - | - | 0/0 | - |")
+    for model, kinds in attribution.items():
+        for kind, entry in kinds.items():
+            labels = ", ".join(
+                f"seed {seed}: {modality}"
+                for seed, modality in zip(
+                    entry["seeds"], entry["first_alarm_modalities"], strict=True
+                )
+            )
+            fraction = (
+                "unknown"
+                if entry["fraction_matching_expected"] is None
+                else f"{entry['fraction_matching_expected']:.3f}"
+            )
+            lines.append(
+                f"| {model} | {kind} | {entry['expected_modality'] or 'unknown'} | {labels} | "
+                f"{entry['matches_expected']}/{len(entry['seeds'])} | {fraction} |"
+            )
     lines.append("")
     return "\n".join(lines)
 
@@ -1023,6 +1145,7 @@ def evaluate_seeds(
         "seeds": list(seeds),
         "per_seed": {str(seed): per_seed[seed] for seed in seeds},
         "aggregate": aggregate_metrics(per_seed),
+        "attribution": aggregate_attribution(per_seed),
         "note": SYNTHETIC_NOTE,
     }
     out_path.mkdir(parents=True, exist_ok=True)
@@ -1036,8 +1159,10 @@ def evaluate_seeds(
 __all__ = [
     "EvaluationResult",
     "SYNTHETIC_NOTE",
+    "aggregate_attribution",
     "aggregate_metrics",
     "evaluate",
     "evaluate_seeds",
     "parse_seeds",
+    "pca_training_means",
 ]

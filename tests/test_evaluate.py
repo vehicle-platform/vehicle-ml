@@ -26,6 +26,7 @@ from vehicle_ml.evaluate import (
     MODEL_NAMES,
     SYNTHETIC_NOTE,
     _imu_bands,
+    aggregate_attribution,
     aggregate_metrics,
     evaluate,
     evaluate_seeds,
@@ -391,9 +392,38 @@ def test_seeds_write_per_seed_entries_and_an_aggregate(tmp_path: Path) -> None:
     for stats in aggregate.values():
         assert stats["min"] <= stats["mean"] <= stats["max"]
         assert 1 <= stats["n_seeds"] <= 2
+
+    attribution = data["attribution"]
+    assert attribution
+    for kinds in attribution.values():
+        for entry in kinds.values():
+            assert len(entry["first_alarm_modalities"]) == len(entry["seeds"])
+            assert entry["matches_expected"] == sum(
+                modality == entry["expected_modality"]
+                for modality in entry["first_alarm_modalities"]
+            )
+            if entry["expected_modality"] is None:
+                assert entry["fraction_matching_expected"] is None
+            else:
+                assert entry["fraction_matching_expected"] == pytest.approx(
+                    entry["matches_expected"] / len(entry["seeds"])
+                )
+            assert entry["matches_expected"] + entry["no_alarm_seeds"] + entry[
+                "not_evaluated_seeds"
+            ] + entry["mixed_seeds"] <= len(entry["seeds"])
+    assert "wheel_vibration" in attribution["physics"]
+    assert set(attribution["physics"]) <= {
+        "thermostat_stuck_open",
+        "fan_failure",
+        "plateau_sag",
+        "clutch_slip",
+        "wheel_vibration",
+    }
     text = result.markdown_path.read_text(encoding="utf-8")
     assert SYNTHETIC_NOTE + "." in text
     assert "| metric | seeds | mean | min | max |" in text
+    assert "## Attribution stability" in text
+    assert "first alarm modality per seed" in text
 
     # The single-seed form is the same evaluation as the matching per-seed entry.
     single = evaluate(root, tmp_path / "single", CONFIG, seed=1)
@@ -423,6 +453,73 @@ def test_aggregate_metrics_uses_only_seeds_that_have_the_fault_kind() -> None:
     }
     assert aggregate["physics.plateau_sag.detection_rate"]["n_seeds"] == 1
     assert aggregate["physics.plateau_sag.detection_rate"]["mean"] == 0.5
+
+
+def test_aggregate_attribution_treats_no_alarm_as_not_a_match() -> None:
+    def entry(
+        *,
+        detected: int,
+        missed: int,
+        first_alarm_modalities: dict[str, int],
+        not_evaluated: int = 0,
+    ) -> dict[str, object]:
+        return {
+            "models": {
+                "physics": {
+                    "test": {
+                        "faults": {
+                            "wheel_vibration": {
+                                "sessions": 1,
+                                "detected": detected,
+                                "missed": missed,
+                                "not_evaluated": not_evaluated,
+                                "expected_modality": "imu",
+                                "first_alarm_modalities": first_alarm_modalities,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+    per_seed = {
+        0: entry(detected=1, missed=0, first_alarm_modalities={"imu": 1}),
+        1: entry(detected=0, missed=1, first_alarm_modalities={}),
+    }
+    result = aggregate_attribution(per_seed)
+    entry_out = result["physics"]["wheel_vibration"]
+    assert entry_out["seeds"] == [0, 1]
+    assert entry_out["first_alarm_modalities"] == ["imu", "no alarm"]
+    assert entry_out["matches_expected"] == 1
+    assert entry_out["fraction_matching_expected"] == 0.5
+    assert entry_out["no_alarm_seeds"] == 1
+
+
+def test_aggregate_attribution_reports_all_unscored_seeds() -> None:
+    per_seed = {
+        0: {
+            "models": {
+                "baseline_pca": {
+                    "test": {
+                        "faults": {
+                            "wheel_vibration": {
+                                "sessions": 1,
+                                "detected": 0,
+                                "missed": 0,
+                                "not_evaluated": 1,
+                                "expected_modality": "imu",
+                                "first_alarm_modalities": {},
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    entry = aggregate_attribution(per_seed)["baseline_pca"]["wheel_vibration"]
+    assert entry["first_alarm_modalities"] == ["not evaluated"]
+    assert entry["not_evaluated_seeds"] == 1
+    assert entry["fraction_matching_expected"] == 0.0
 
 
 def test_cli_seeds_end_to_end(tmp_path: Path) -> None:
