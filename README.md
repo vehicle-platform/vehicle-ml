@@ -85,10 +85,43 @@ uv run vehicle-ml evaluate \
 The evaluator fits thresholds per model on **validation healthy** sessions for a target
 false-alarm rate. `--target-false-alarms-per-hour` defaults to `1.0` per hour of healthy
 riding. On the test split it reports false alarms per hour, detection delay after onset,
-missed faults, and the detecting modality per fault kind. It writes `evaluation.json` and
-`evaluation.md` with the split, seed and defs version. Ground truth is read from an
-optional `faults.json` next to the data directory (the ML-11 synthetic helper writes
-it); without that file the report contains false alarms only.
+missed faults, and the modality behind each alarm per fault kind. It writes
+`evaluation.json` and `evaluation.md` with the split, seed and defs version. Ground truth
+is read from an optional `faults.json` next to the data directory (the ML-11 synthetic
+helper writes it, with an `expected_modality` per session); without that file the report
+contains false alarms only.
+
+### Attribution (rule 3)
+
+Every feature column has a source (`did.<NAME>`, `derived.<name>`, `sensor.<name>`) and a
+modality: `can` for DIDs and derived signals, `imu` for `sensor.imu_*`, `other` for the
+rest. Both are derived from the pinned defs tables, never from a hand-written list. The
+baseline windows include IMU FFT band features (equal-width bands from 0 Hz to the
+Nyquist frequency given by the defs IMU `sample_period_ms`). Each alarm records:
+
+- physics: modality `can` and the estimator group (`cooling`, `charging`,
+  `longitudinal`) from `[groups]` in the role config;
+- PCA baseline: the modality holding the largest share of the window's squared
+  reconstruction error (per-feature residuals summed per modality);
+- robust-z baseline: the modality of the feature with the largest |z|.
+
+The report has one row per model and fault kind: expected modality, detections, alarm
+windows per modality, the modality of the first alarm after onset and whether it equals
+the expected one. A model that does not alarm is reported as a miss.
+
+The synthetic `wheel_vibration` scenario is the rule-3 weak-CAN case: from onset a
+narrow-band line appears in `imu_accel_z` at 4x the rear-wheel rotation frequency, while
+every CAN and derived column stays identical to the healthy session with the same seed.
+The CAN-only physics models are expected to miss it, and they are not tuned to catch it.
+
+### Several split seeds
+
+`vehicle-ml evaluate --seeds 0,1,2` runs the session split and the whole evaluation once
+per seed (`--seed N` stays the single-seed form; the two are exclusive). A seed changes
+only the split, never the data. Per-seed reports go to `<out>/seed-<n>/`; the top-level
+`evaluation.json` / `evaluation.md` hold every per-seed result plus the mean, min and max
+of each metric over the seeds that produced it. A fault kind that is in the test split
+for only some seeds is aggregated over those seeds (the report states how many).
 
 Role config and defs bridge:
 

@@ -16,7 +16,9 @@ from vehicle_ml.evaluate import (
     MODEL_NAMES,
     SYNTHETIC_NOTE,
     _imu_bands,
+    aggregate_metrics,
     evaluate,
+    evaluate_seeds,
     pca_alarm_modality,
     z_alarm_modality,
 )
@@ -235,3 +237,97 @@ def test_unknown_expected_modality_is_rejected(tmp_path: Path) -> None:
     (root / "faults.json").write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="expected_modality"):
         evaluate(root, tmp_path / "out", CONFIG)
+
+
+def test_seeds_write_per_seed_entries_and_an_aggregate(tmp_path: Path) -> None:
+    root, _ = _dataset(tmp_path)
+    out = tmp_path / "multi"
+    result = evaluate_seeds(root, out, CONFIG, [0, 1])
+
+    data = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert data["seeds"] == [0, 1]
+    assert set(data["per_seed"]) == {"0", "1"}
+    assert data["per_seed"]["0"]["seed"] == 0
+    assert data["per_seed"]["1"]["seed"] == 1
+    # A seed changes only the split, never the data: both runs see the same sessions.
+    sessions = [sum(entry["split"].values(), []) for entry in data["per_seed"].values()]
+    assert sorted(sessions[0]) == sorted(sessions[1])
+    assert data["per_seed"]["0"]["split"] != data["per_seed"]["1"]["split"]
+    for seed in (0, 1):
+        assert (out / f"seed-{seed}" / "evaluation.json").exists()
+        assert (out / f"seed-{seed}" / "evaluation.md").exists()
+
+    aggregate = data["aggregate"]
+    assert "physics.false_alarms_per_hour" in aggregate
+    for stats in aggregate.values():
+        assert stats["min"] <= stats["mean"] <= stats["max"]
+        assert 1 <= stats["n_seeds"] <= 2
+    text = result.markdown_path.read_text(encoding="utf-8")
+    assert SYNTHETIC_NOTE + "." in text
+    assert "| metric | seeds | mean | min | max |" in text
+
+    # The single-seed form is the same evaluation as the matching per-seed entry.
+    single = evaluate(root, tmp_path / "single", CONFIG, seed=1)
+    assert single.data == data["per_seed"]["1"]
+
+
+def test_aggregate_metrics_uses_only_seeds_that_have_the_fault_kind() -> None:
+    def entry(per_hour: float, faults: dict[str, dict[str, object]]) -> dict[str, object]:
+        return {
+            "models": {
+                "physics": {"test": {"false_alarms": {"per_hour": per_hour}, "faults": faults}}
+            }
+        }
+
+    fault = {
+        "sessions": 2,
+        "detected": 1,
+        "median_delay_ms": 5000.0,
+        "first_alarm_matches_expected": 1,
+    }
+    aggregate = aggregate_metrics({0: entry(1.0, {"plateau_sag": fault}), 1: entry(3.0, {})})
+    assert aggregate["physics.false_alarms_per_hour"] == {
+        "n_seeds": 2,
+        "mean": 2.0,
+        "min": 1.0,
+        "max": 3.0,
+    }
+    assert aggregate["physics.plateau_sag.detection_rate"]["n_seeds"] == 1
+    assert aggregate["physics.plateau_sag.detection_rate"]["mean"] == 0.5
+
+
+def test_cli_seeds_end_to_end(tmp_path: Path) -> None:
+    root, _ = _dataset(tmp_path)
+    out = tmp_path / "cli-seeds"
+    assert (
+        main(
+            ["evaluate", "--data-dir", str(root), "--out", str(out), "--config", str(CONFIG)]
+            + ["--seeds", "0,1"]
+        )
+        == 0
+    )
+    assert (out / "seed-0" / "evaluation.json").exists()
+    assert (out / "seed-1" / "evaluation.json").exists()
+    assert (out / "evaluation.json").exists()
+
+
+@pytest.mark.parametrize("bad", ["", "0,,1", "a,b", "0,0", "1.5"])
+def test_cli_bad_seed_list_exits_non_zero(tmp_path: Path, bad: str) -> None:
+    root, _ = _dataset(tmp_path)
+    out = tmp_path / "bad-seeds"
+    code = main(
+        ["evaluate", "--data-dir", str(root), "--out", str(out), "--config", str(CONFIG)]
+        + ["--seeds", bad]
+    )
+    assert code == 2
+    assert not (out / "evaluation.json").exists()
+
+
+def test_cli_rejects_seed_together_with_seeds(tmp_path: Path) -> None:
+    root, _ = _dataset(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["evaluate", "--data-dir", str(root), "--out", str(tmp_path / "o")]
+            + ["--config", str(CONFIG), "--seed", "1", "--seeds", "0,1"]
+        )
+    assert excinfo.value.code != 0

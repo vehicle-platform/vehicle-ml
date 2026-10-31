@@ -8,7 +8,7 @@ from collections.abc import Sequence
 
 from vehicle_ml.data.store import KINDS, SessionStore
 from vehicle_ml.dataset import build_dataset, write_dataset
-from vehicle_ml.evaluate import evaluate
+from vehicle_ml.evaluate import evaluate, evaluate_seeds, parse_seeds
 
 
 def _parse_bands(text: str | None) -> dict[str, list[tuple[float, float]]]:
@@ -56,7 +56,14 @@ def _parser() -> argparse.ArgumentParser:
     evaluation.add_argument("--data-dir", required=True)
     evaluation.add_argument("--out", required=True)
     evaluation.add_argument("--config", required=True)
-    evaluation.add_argument("--seed", type=int, default=0)
+    seed_group = evaluation.add_mutually_exclusive_group()
+    seed_group.add_argument("--seed", type=int, default=0, help="split seed (default: 0)")
+    seed_group.add_argument(
+        "--seeds",
+        default=None,
+        help="comma-separated split seeds, e.g. 0,1,2: one evaluation per seed plus "
+        "mean/min/max per metric",
+    )
     evaluation.add_argument(
         "--target-false-alarms-per-hour",
         type=float,
@@ -74,16 +81,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "evaluate":
         try:
-            result = evaluate(
-                args.data_dir,
-                args.out,
-                args.config,
-                seed=args.seed,
-                target_false_alarms_per_hour=args.target_false_alarms_per_hour,
-                window_ms=args.window_ms,
-                stride_ms=args.stride_ms,
-                max_gap_ms=args.max_gap_ms,
-            )
+            options = {
+                "target_false_alarms_per_hour": args.target_false_alarms_per_hour,
+                "window_ms": args.window_ms,
+                "stride_ms": args.stride_ms,
+                "max_gap_ms": args.max_gap_ms,
+            }
+            if args.seeds is not None:
+                seeds = parse_seeds(args.seeds)
+                result = evaluate_seeds(args.data_dir, args.out, args.config, seeds, **options)
+                print(f"wrote {result.json_path} and {result.markdown_path} ({len(seeds)} seeds)")
+                return 0
+            result = evaluate(args.data_dir, args.out, args.config, seed=args.seed, **options)
         except ValueError as exc:
             print(f"vehicle-ml: {exc}", file=sys.stderr)
             return 2

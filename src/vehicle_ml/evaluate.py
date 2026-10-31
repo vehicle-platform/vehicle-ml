@@ -738,4 +738,128 @@ def evaluate(
     return EvaluationResult(data=data, json_path=json_path, markdown_path=markdown_path)
 
 
-__all__ = ["EvaluationResult", "SYNTHETIC_NOTE", "evaluate"]
+def parse_seeds(text: str) -> list[int]:
+    """Parse ``--seeds 0,1,2``: at least one integer, no duplicates."""
+    items = [item.strip() for item in text.split(",")]
+    try:
+        seeds = [int(item) for item in items]
+    except ValueError:
+        raise ValueError(f"invalid seed list {text!r}; expected integers like 0,1,2") from None
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"duplicate seed in {text!r}")
+    return seeds
+
+
+def _seed_metrics(data: Mapping[str, object]) -> dict[str, float]:
+    """The scalar metrics of one single-seed evaluation, keyed ``model.[kind.]metric``."""
+    metrics: dict[str, float] = {}
+    for model, entry in data["models"].items():
+        test = entry["test"]
+        metrics[f"{model}.false_alarms_per_hour"] = float(test["false_alarms"]["per_hour"])
+        for kind, fault in test["faults"].items():
+            sessions = int(fault["sessions"])
+            prefix = f"{model}.{kind}"
+            metrics[f"{prefix}.detection_rate"] = fault["detected"] / sessions
+            if fault["median_delay_ms"] is not None:
+                metrics[f"{prefix}.median_delay_ms"] = float(fault["median_delay_ms"])
+            if fault["first_alarm_matches_expected"] is not None:
+                metrics[f"{prefix}.first_alarm_expected_rate"] = (
+                    fault["first_alarm_matches_expected"] / sessions
+                )
+    return metrics
+
+
+def aggregate_metrics(per_seed: Mapping[int, Mapping[str, object]]) -> dict[str, dict[str, float]]:
+    """Mean/min/max of every metric over the seeds that produced it.
+
+    A fault kind that falls into the test split for only some seeds is aggregated over
+    those seeds; ``n_seeds`` says how many.
+    """
+    collected: dict[str, list[float]] = {}
+    for data in per_seed.values():
+        for name, value in _seed_metrics(data).items():
+            collected.setdefault(name, []).append(value)
+    return {
+        name: {
+            "n_seeds": len(values),
+            "mean": float(np.mean(values)),
+            "min": float(np.min(values)),
+            "max": float(np.max(values)),
+        }
+        for name, values in sorted(collected.items())
+    }
+
+
+def _aggregate_markdown(data: Mapping[str, object]) -> str:
+    seeds = data["seeds"]
+    lines = [
+        "# D-083 stage-1 evaluation over several split seeds",
+        "",
+        f"- defs: {data['defs_version']}",
+        f"- seeds: {', '.join(str(seed) for seed in seeds)}",
+        "- a seed changes only the session split, never the data; per-seed reports are in "
+        + ", ".join(f"`seed-{seed}/`" for seed in seeds),
+        "",
+        SYNTHETIC_NOTE + ".",
+        "",
+        MISS_NOTE,
+        "",
+        "## Metrics over seeds",
+        "",
+        "| metric | seeds | mean | min | max |",
+        "|---|---|---|---|---|",
+    ]
+    for name, stats in data["aggregate"].items():
+        lines.append(
+            f"| {name} | {stats['n_seeds']} | {stats['mean']:.6g} | {stats['min']:.6g} | "
+            f"{stats['max']:.6g} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def evaluate_seeds(
+    data_dir: str | Path,
+    out_dir: str | Path,
+    config_path: str | Path,
+    seeds: Sequence[int],
+    **kwargs: object,
+) -> EvaluationResult:
+    """Run ``evaluate`` once per split seed and aggregate the metrics.
+
+    Per-seed reports go to ``<out>/seed-<n>/``; ``<out>/evaluation.json`` and
+    ``evaluation.md`` hold every per-seed result plus the mean/min/max per metric.
+    """
+    if not seeds:
+        raise ValueError("at least one seed is required")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("seeds must be unique")
+    out_path = Path(out_dir)
+    per_seed: dict[int, dict] = {}
+    for seed in seeds:
+        result = evaluate(data_dir, out_path / f"seed-{seed}", config_path, seed=seed, **kwargs)
+        per_seed[seed] = result.data
+
+    data: dict[str, object] = {
+        "defs_version": defs_version(),
+        "seeds": list(seeds),
+        "per_seed": {str(seed): per_seed[seed] for seed in seeds},
+        "aggregate": aggregate_metrics(per_seed),
+        "note": SYNTHETIC_NOTE,
+    }
+    out_path.mkdir(parents=True, exist_ok=True)
+    json_path = out_path / "evaluation.json"
+    markdown_path = out_path / "evaluation.md"
+    json_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    markdown_path.write_text(_aggregate_markdown(data), encoding="utf-8")
+    return EvaluationResult(data=data, json_path=json_path, markdown_path=markdown_path)
+
+
+__all__ = [
+    "EvaluationResult",
+    "SYNTHETIC_NOTE",
+    "aggregate_metrics",
+    "evaluate",
+    "evaluate_seeds",
+    "parse_seeds",
+]
