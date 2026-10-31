@@ -33,6 +33,7 @@ from vehicle_ml.data.sources import MODALITIES, feature_metadata, imu_columns
 from vehicle_ml.data.store import SessionStore
 from vehicle_ml.dataset import build_dataset
 from vehicle_ml.defs import defs_version, vehicle_derived
+from vehicle_ml.features import IDENTITY_COLUMNS
 from vehicle_ml.normalize import Standardizer
 from vehicle_ml.physics.charging import fit_charging
 from vehicle_ml.physics.config import RoleMap, load_roles
@@ -80,6 +81,11 @@ MISS_NOTE = (
     "reported as misses and the models are not tuned to catch it (rule 4)."
 )
 SYNTHETIC_NOTE = "synthetic data; no generalisation claim (rule 4)"
+NO_ALARM = "no alarm"
+NOT_EVALUATED = "not evaluated"
+MIXED = "mixed"
+UNATTRIBUTED = "unattributed"  # an alarm whose window has no attributable modality
+NOT_CALIBRATED = "not calibrated"
 
 
 @dataclass(frozen=True)
@@ -388,22 +394,45 @@ def _episodes(mask: np.ndarray) -> int:
     return int(np.count_nonzero(mask & ~np.r_[False, mask[:-1]]))
 
 
+def _scored_hours(scored: np.ndarray, start_ms: np.ndarray, end_ms: np.ndarray) -> float:
+    """Hours covered by the contiguous runs of scored windows (unscored gaps excluded)."""
+    if scored.size == 0:
+        return 0.0
+    first = np.flatnonzero(scored & ~np.r_[False, scored[:-1]])
+    last = np.flatnonzero(scored & ~np.r_[scored[1:], False])
+    total = sum(
+        float(end_ms[a : b + 1].max() - start_ms[a : b + 1].min())
+        for a, b in zip(first, last, strict=True)
+    )
+    return total / 3_600_000.0
+
+
 def _false_alarms(
     scores: pd.DataFrame,
     model: str,
     threshold: float,
     session_ids: Sequence[str],
 ) -> dict[str, float]:
+    """Alarm episodes and scored hours of healthy sessions.
+
+    Episodes are counted over the full time-ordered windows with unscored windows as
+    "no alarm", so two alarm runs separated by an unscored gap stay two episodes. Hours
+    sum each contiguous scored run, so an unscored gap is not counted as healthy riding.
+    """
     episodes = 0
     hours = 0.0
     for session_id in session_ids:
         rows = scores.loc[scores["session_id"] == session_id].sort_values("start_ms")
-        scored = rows.loc[rows[model].notna()]
-        if scored.empty:
-            continue
-        mask = scored[model].to_numpy(dtype=float) > threshold
-        episodes += _episodes(mask)
-        hours += float(scored["end_ms"].max() - scored["start_ms"].min()) / 3_600_000.0
+        values = rows[model].to_numpy(dtype=float)
+        scored = np.isfinite(values)
+        with np.errstate(invalid="ignore"):
+            alarm = scored & (values > threshold)
+        episodes += _episodes(alarm)
+        hours += _scored_hours(
+            scored,
+            rows["start_ms"].to_numpy(dtype=float),
+            rows["end_ms"].to_numpy(dtype=float),
+        )
     return {
         "episodes": float(episodes),
         "hours": hours,
@@ -499,13 +528,20 @@ def _modalities_of(feature_names: Sequence[str]) -> list[str]:
     return [metadata[name].modality for name in feature_names]
 
 
-def _baseline_feature_names(features: pd.DataFrame) -> list[str]:
-    """Numeric feature columns that have at least one finite value in the fit rows."""
-    skipped = {"session_id", "start_ms", "end_ms", "split"}
+def _numeric_feature_columns(features: pd.DataFrame) -> list[str]:
+    """Numeric feature columns (identity columns and the split label excluded)."""
+    skipped = {*IDENTITY_COLUMNS, "split"}
     return [
         str(column)
         for column in features.select_dtypes(include=[np.number]).columns
-        if str(column) not in skipped and features[column].notna().any()
+        if str(column) not in skipped
+    ]
+
+
+def _baseline_feature_names(features: pd.DataFrame) -> list[str]:
+    """Numeric feature columns that have at least one finite value in the fit rows."""
+    return [
+        column for column in _numeric_feature_columns(features) if features[column].notna().any()
     ]
 
 
@@ -517,35 +553,23 @@ def _baseline_unscored(
 ) -> dict[str, list[dict[str, object]]]:
     """Sessions/windows without every baseline feature, with the missing modalities."""
     matrix = features[baseline.feature_names].to_numpy(dtype=float)
-    complete = np.isfinite(matrix).all(axis=1)
+    missing = ~np.isfinite(matrix)
+    incomplete = missing.any(axis=1)
+    session = features["session_id"].astype(str).to_numpy()
+    modality_of = np.asarray(modalities, dtype=object)
     result: dict[str, list[dict[str, object]]] = {}
     for part, session_ids in split.items():
-        allowed = set(session_ids)
-        entries: dict[str, dict[str, object]] = {}
-        for index in np.flatnonzero(~complete):
-            session_id = str(features["session_id"].iloc[index])
-            if session_id not in allowed:
-                continue
-            missing = sorted(
-                {
-                    modality
-                    for position, modality in enumerate(modalities)
-                    if not np.isfinite(matrix[index, position])
-                }
-            )
-            entry = entries.setdefault(
-                session_id,
-                {"session_id": session_id, "windows": 0, "missing_modalities": set()},
-            )
-            entry["windows"] = int(entry["windows"]) + 1
-            entry["missing_modalities"].update(missing)
+        rows = np.flatnonzero(incomplete & np.isin(session, list(session_ids)))
+        groups = pd.DataFrame({"session_id": session[rows]}).groupby("session_id").indices
         result[part] = [
             {
-                "session_id": session_id,
-                "windows": int(entries[session_id]["windows"]),
-                "missing_modalities": sorted(entries[session_id]["missing_modalities"]),
+                "session_id": str(session_id),
+                "windows": int(len(positions)),
+                "missing_modalities": sorted(
+                    {str(name) for name in modality_of[missing[rows[positions]].any(axis=0)]}
+                ),
             }
-            for session_id in sorted(entries)
+            for session_id, positions in sorted(groups.items())
         ]
     return result
 
@@ -586,6 +610,11 @@ def _physics_attribution(scores: pd.DataFrame, group_of: Mapping[str, str]) -> p
         },
         index=scores.index,
     )
+
+
+def _modality_label(value: object) -> str:
+    """Report label of an alarm modality; an empty attribution is ``unattributed``."""
+    return str(value) or UNATTRIBUTED
 
 
 def _fault_results(
@@ -639,8 +668,8 @@ def _fault_results(
         first = alarm.iloc[0]
         entry["detected"] = int(entry["detected"]) + 1
         entry["delays_ms"].append(int(first["start_ms"]) - onset)
-        entry["modalities"].update(str(value) for value in alarm[f"{model}_modality"])
-        first_modality = str(first[f"{model}_modality"])
+        entry["modalities"].update(_modality_label(value) for value in alarm[f"{model}_modality"])
+        first_modality = _modality_label(first[f"{model}_modality"])
         entry["first_alarm_modalities"][first_modality] += 1
         if expected is not None and first_modality == expected:
             entry["first_alarm_matches_expected"] = int(entry["first_alarm_matches_expected"]) + 1
@@ -699,6 +728,19 @@ def _markdown(data: dict) -> str:
         "never counted as a detection, a miss or a false alarm. The physics models still "
         "score it.",
         "",
+    ]
+    excluded = data.get("baseline_excluded_features", [])
+    if excluded:
+        lines.append(
+            "Features without a finite value in the healthy training windows are excluded "
+            f"from the baselines (modalities: {', '.join(data['baseline_excluded_modalities'])}): "
+            + ", ".join(f"`{name}`" for name in excluded)
+            + "."
+        )
+    else:
+        lines.append("No feature was excluded from the baselines.")
+    lines += [
+        "",
         "| split | session | unscored windows | missing modalities |",
         "|---|---|---|---|",
     ]
@@ -714,7 +756,16 @@ def _markdown(data: dict) -> str:
             )
     lines += ["", "## Thresholds", "", "| model | threshold |", "|---|---|"]
     for model in MODEL_NAMES:
-        lines.append(f"| {model} | {data['thresholds'][model]:.6g} |")
+        threshold = data["thresholds"][model]
+        lines.append(f"| {model} | {NOT_CALIBRATED if threshold is None else f'{threshold:.6g}'} |")
+    uncalibrated = data.get("not_calibrated", [])
+    if uncalibrated:
+        lines += [
+            "",
+            f"Note: {', '.join(uncalibrated)} {NOT_CALIBRATED}: no validation healthy window "
+            "has a score, so every window of the model is treated as unscored (its faults "
+            "are counted as not evaluated, no false-alarm hours).",
+        ]
     lines += [
         "",
         "## PCA attribution reference",
@@ -826,6 +877,12 @@ def evaluate(
 
     baseline = _fit_baseline(result.features, result.split, train_healthy)
     baseline_scores = baseline.scores(result.features)
+    excluded_features = [
+        name
+        for name in _numeric_feature_columns(result.features)
+        if name not in baseline.feature_names
+    ]
+    excluded_modalities = sorted(set(_modalities_of(excluded_features)))
     feature_modalities = _modalities_of(baseline.feature_names)
     baseline_unscored = _baseline_unscored(
         result.features, baseline, feature_modalities, result.split
@@ -864,24 +921,26 @@ def evaluate(
     scores["physics_group"] = attribution["physics_group"].to_numpy()
 
     val_healthy = _healthy(result.split["val"], faults)
-    thresholds = {
-        model: _threshold(
-            scores.loc[scores["session_id"].isin(val_healthy), model],
-            target_false_alarms_per_hour,
-            stride_ms,
-        )
-        for model in MODEL_NAMES
-    }
+    thresholds: dict[str, float | None] = {}
+    for model in MODEL_NAMES:
+        validation = scores.loc[scores["session_id"].isin(val_healthy), model]
+        if np.isfinite(validation.to_numpy(dtype=float)).any():
+            thresholds[model] = _threshold(validation, target_false_alarms_per_hour, stride_ms)
+        else:
+            # Nothing to calibrate on: the whole model is unscored, never a miss.
+            thresholds[model] = None
+            scores[model] = np.nan
 
     test_ids = result.split["test"]
     test_healthy = _healthy(test_ids, faults)
     models: dict[str, dict[str, object]] = {}
     for model in MODEL_NAMES:
+        limit = math.nan if thresholds[model] is None else thresholds[model]
         models[model] = {
             "threshold": thresholds[model],
             "test": {
-                "false_alarms": _false_alarms(scores, model, thresholds[model], test_healthy),
-                "faults": _fault_results(scores, model, thresholds[model], test_ids, faults),
+                "false_alarms": _false_alarms(scores, model, limit, test_healthy),
+                "faults": _fault_results(scores, model, limit, test_ids, faults),
             },
         }
 
@@ -901,6 +960,9 @@ def evaluate(
         "threshold_sessions": val_healthy,
         "thresholds": thresholds,
         "pca_modality_training_mean_sq": pca_training_mean_sq,
+        "not_calibrated": [model for model in MODEL_NAMES if thresholds[model] is None],
+        "baseline_excluded_features": excluded_features,
+        "baseline_excluded_modalities": excluded_modalities,
         "baseline_unscored": baseline_unscored,
         "models": models,
         "faults_present": bool(faults),
@@ -929,25 +991,31 @@ def parse_seeds(text: str) -> list[int]:
 
 
 def _seed_metrics(data: Mapping[str, object]) -> dict[str, float]:
-    """The scalar metrics of one single-seed evaluation, keyed ``model.[kind.]metric``."""
+    """The scalar metrics of one single-seed evaluation, keyed ``model.[kind.]metric``.
+
+    A rate with nothing to divide by (no evaluated session of a fault kind, no scored
+    healthy hour) is omitted, so an all-unscored seed never counts like a miss.
+    """
     metrics: dict[str, float] = {}
     for model, entry in data["models"].items():
         test = entry["test"]
-        metrics[f"{model}.false_alarms_per_hour"] = float(test["false_alarms"]["per_hour"])
+        hours = test["false_alarms"].get("hours")
+        if hours is None or hours > 0.0:
+            # No scored healthy hour (an uncalibrated model) leaves the rate undefined.
+            metrics[f"{model}.false_alarms_per_hour"] = float(test["false_alarms"]["per_hour"])
         for kind, fault in test["faults"].items():
             sessions = int(fault["sessions"])
             not_evaluated = int(fault.get("not_evaluated", 0))
             evaluated = sessions - not_evaluated
             prefix = f"{model}.{kind}"
-            metrics[f"{prefix}.detection_rate"] = (
-                fault["detected"] / evaluated if evaluated else 0.0
-            )
+            if evaluated:
+                metrics[f"{prefix}.detection_rate"] = fault["detected"] / evaluated
             metrics[f"{prefix}.not_evaluated_rate"] = not_evaluated / sessions if sessions else 0.0
             if fault["median_delay_ms"] is not None:
                 metrics[f"{prefix}.median_delay_ms"] = float(fault["median_delay_ms"])
-            if fault["first_alarm_matches_expected"] is not None:
+            if fault["first_alarm_matches_expected"] is not None and evaluated:
                 metrics[f"{prefix}.first_alarm_expected_rate"] = (
-                    fault["first_alarm_matches_expected"] / evaluated if evaluated else 0.0
+                    fault["first_alarm_matches_expected"] / evaluated
                 )
     return metrics
 
@@ -963,15 +1031,15 @@ def _seed_first_alarm_modality(fault: Mapping[str, object]) -> str:
     not_evaluated = int(fault.get("not_evaluated", 0))
     if detected == 0:
         if sessions > 0 and not_evaluated == sessions:
-            return "not evaluated"
-        return "no alarm"
+            return NOT_EVALUATED
+        return NO_ALARM
     modalities = fault.get("first_alarm_modalities", {})
     if not isinstance(modalities, Mapping):
         raise ValueError("first_alarm_modalities must be an object")
-    names = sorted(str(name) for name, count in modalities.items() if int(count) > 0)
-    if len(names) == 1:
+    names = sorted(_modality_label(name) for name, count in modalities.items() if int(count) > 0)
+    if len(set(names)) == 1:
         return names[0]
-    return "mixed"
+    return MIXED
 
 
 def aggregate_attribution(
@@ -994,45 +1062,31 @@ def aggregate_attribution(
                     {
                         "expected_modality": fault.get("expected_modality"),
                         "seeds": [],
-                        "first_alarm_modalities": [],
-                        "matches_expected": 0,
-                        "no_alarm_seeds": 0,
-                        "not_evaluated_seeds": 0,
-                        "mixed_seeds": 0,
+                        "labels": [],
                     },
                 )
-                modality = _seed_first_alarm_modality(fault)
                 bucket["seeds"].append(int(seed))
-                bucket["first_alarm_modalities"].append(modality)
-                if modality == "no alarm":
-                    bucket["no_alarm_seeds"] = int(bucket["no_alarm_seeds"]) + 1
-                elif modality == "not evaluated":
-                    bucket["not_evaluated_seeds"] = int(bucket["not_evaluated_seeds"]) + 1
-                elif modality == "mixed":
-                    bucket["mixed_seeds"] = int(bucket["mixed_seeds"]) + 1
-                if (
-                    bucket["expected_modality"] is not None
-                    and modality == bucket["expected_modality"]
-                ):
-                    bucket["matches_expected"] = int(bucket["matches_expected"]) + 1
+                bucket["labels"].append(_seed_first_alarm_modality(fault))
 
     result: dict[str, dict[str, dict[str, object]]] = {}
     for model, kinds in sorted(collected.items()):
         result[model] = {}
         for kind, bucket in sorted(kinds.items()):
             seeds = [int(seed) for seed in bucket["seeds"]]
+            labels = Counter(bucket["labels"])
             expected = bucket["expected_modality"]
+            matches = labels[expected] if expected is not None else 0
             result[model][kind] = {
                 "expected_modality": expected,
                 "seeds": seeds,
-                "first_alarm_modalities": list(bucket["first_alarm_modalities"]),
-                "matches_expected": int(bucket["matches_expected"]),
+                "first_alarm_modalities": list(bucket["labels"]),
+                "matches_expected": matches,
                 "fraction_matching_expected": (
-                    int(bucket["matches_expected"]) / len(seeds) if expected is not None else None
+                    matches / len(seeds) if expected is not None else None
                 ),
-                "no_alarm_seeds": int(bucket["no_alarm_seeds"]),
-                "not_evaluated_seeds": int(bucket["not_evaluated_seeds"]),
-                "mixed_seeds": int(bucket["mixed_seeds"]),
+                "no_alarm_seeds": labels[NO_ALARM],
+                "not_evaluated_seeds": labels[NOT_EVALUATED],
+                "mixed_seeds": labels[MIXED],
             }
     return result
 

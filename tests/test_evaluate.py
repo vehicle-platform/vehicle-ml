@@ -24,7 +24,11 @@ from vehicle_ml.dataset import build_dataset, write_dataset
 from vehicle_ml.evaluate import (
     MISS_NOTE,
     MODEL_NAMES,
+    NOT_CALIBRATED,
     SYNTHETIC_NOTE,
+    UNATTRIBUTED,
+    _false_alarms,
+    _fault_results,
     _imu_bands,
     aggregate_attribution,
     aggregate_metrics,
@@ -57,6 +61,22 @@ def _mixed_imu_dataset(tmp_path: Path) -> tuple[Path, PhysicsDataset]:
     dataset = make_physics_data_dir(root, specs)
     dataset.write_faults(root / "faults.json")
     return root, dataset
+
+
+def _without_imu(tmp_path: Path, part: str, name: str) -> tuple[Path, list[str]]:
+    """A dataset where every healthy session of ``part`` (seed 0 split) has no IMU."""
+    probe_root, probe = _dataset(tmp_path / "probe")
+    split = build_dataset(probe_root, tmp_path / "probe-out", seed=0).split
+    truths = probe.truths()
+    chosen = [sid for sid in split[part] if truths[sid].kind is None]
+    assert chosen
+    specs = tuple(
+        replace(spec, has_imu=False) if spec.session_id in chosen else spec
+        for spec in DEFAULT_PHYSICS_SESSIONS
+    )
+    root = tmp_path / name
+    make_physics_data_dir(root, specs).write_faults(root / "faults.json")
+    return root, chosen
 
 
 def _expected_fault_kinds(dataset: PhysicsDataset, split: dict[str, list[str]]) -> set[str]:
@@ -557,3 +577,116 @@ def test_cli_rejects_seed_together_with_seeds(tmp_path: Path) -> None:
             + ["--config", str(CONFIG), "--seed", "1", "--seeds", "0,1"]
         )
     assert excinfo.value.code != 0
+
+
+def test_all_unscored_seed_is_omitted_not_counted_as_a_miss() -> None:
+    def entry(not_evaluated: int) -> dict[str, object]:
+        fault = {
+            "sessions": 1,
+            "detected": 0,
+            "missed": 1 - not_evaluated,
+            "not_evaluated": not_evaluated,
+            "median_delay_ms": None,
+            "first_alarm_matches_expected": 0,
+        }
+        return {
+            "models": {
+                "baseline_z": {
+                    "test": {
+                        "false_alarms": {"per_hour": 0.0, "hours": 1.0},
+                        "faults": {"wheel_vibration": fault},
+                    }
+                }
+            }
+        }
+
+    aggregate = aggregate_metrics({0: entry(0), 1: entry(1)})
+    detection = aggregate["baseline_z.wheel_vibration.detection_rate"]
+    assert detection == {"n_seeds": 1, "mean": 0.0, "min": 0.0, "max": 0.0}
+    assert aggregate["baseline_z.wheel_vibration.first_alarm_expected_rate"]["n_seeds"] == 1
+    assert aggregate["baseline_z.wheel_vibration.not_evaluated_rate"]["n_seeds"] == 2
+    assert aggregate["baseline_z.wheel_vibration.not_evaluated_rate"]["mean"] == 0.5
+
+
+def test_baseline_without_validation_scores_is_not_calibrated(tmp_path: Path) -> None:
+    root, chosen = _without_imu(tmp_path, "val", "val-no-imu")
+    result = evaluate(root, tmp_path / "out", CONFIG)
+    data = result.data
+    assert set(chosen) <= set(data["split"]["val"])
+
+    assert data["thresholds"]["physics"] is not None
+    assert set(data["not_calibrated"]) == {"baseline_pca", "baseline_z"}
+    for model in ("baseline_pca", "baseline_z"):
+        entry = data["models"][model]
+        assert entry["threshold"] is None
+        assert entry["test"]["false_alarms"]["episodes"] == 0.0
+        assert entry["test"]["false_alarms"]["hours"] == 0.0
+        for fault in entry["test"]["faults"].values():
+            assert fault["not_evaluated"] == fault["sessions"]
+            assert fault["detected"] == 0
+            assert fault["missed"] == 0
+    assert data["models"]["physics"]["test"]["false_alarms"]["hours"] > 0.0
+
+    saved = json.loads(result.json_path.read_text(encoding="utf-8"))
+    assert saved["thresholds"]["baseline_pca"] is None
+    text = result.markdown_path.read_text(encoding="utf-8")
+    assert f"| baseline_pca | {NOT_CALIBRATED} |" in text
+
+
+def test_features_without_a_training_value_are_reported_as_excluded(tmp_path: Path) -> None:
+    root, _ = _dataset(tmp_path)
+    plain = evaluate(root, tmp_path / "plain", CONFIG).data
+    assert plain["baseline_excluded_features"] == []
+    assert plain["baseline_excluded_modalities"] == []
+
+    no_imu_root, _ = _without_imu(tmp_path, "train", "train-no-imu")
+    result = evaluate(no_imu_root, tmp_path / "out", CONFIG)
+    data = result.data
+    assert data["baseline_excluded_modalities"] == ["imu"]
+    assert data["baseline_excluded_features"]
+    text = result.markdown_path.read_text(encoding="utf-8")
+    assert "excluded from the baselines (modalities: imu)" in text
+    assert data["baseline_excluded_features"][0] in text
+
+
+def _alarm_frame(values: list[float]) -> pd.DataFrame:
+    starts = np.arange(len(values)) * 1000
+    return pd.DataFrame(
+        {"session_id": "s", "start_ms": starts, "end_ms": starts + 1000, "m": values}
+    )
+
+
+def test_false_alarm_episodes_do_not_merge_across_an_unscored_gap() -> None:
+    frame = _alarm_frame([5.0, 5.0, np.nan, np.nan, 5.0, 5.0, 0.0])
+    result = _false_alarms(frame, "m", 1.0, ["s"])
+    assert result["episodes"] == 2.0
+    # run 1 covers 0-2000 ms, run 2 covers 4000-7000 ms; the 2000 ms gap is excluded
+    assert result["hours"] == pytest.approx(5000 / 3_600_000.0)
+
+
+def test_false_alarm_hours_skip_unscored_edges() -> None:
+    frame = _alarm_frame([np.nan, 0.0, 0.0, np.nan])
+    result = _false_alarms(frame, "m", 1.0, ["s"])
+    assert result["episodes"] == 0.0
+    assert result["hours"] == pytest.approx(2000 / 3_600_000.0)
+
+
+def test_alarm_without_attributable_modality_is_unattributed() -> None:
+    scores = pd.DataFrame(
+        {
+            "session_id": ["f"] * 2,
+            "start_ms": [0, 1000],
+            "end_ms": [1000, 2000],
+            "baseline_z": [5.0, 5.0],
+            "baseline_z_modality": ["", "imu"],
+        }
+    )
+    faults = {"f": {"fault": "k", "onset_ms": 0, "expected_modality": "imu"}}
+    result = _fault_results(scores, "baseline_z", 1.0, ["f"], faults)["k"]
+    assert result["modalities"] == {UNATTRIBUTED: 1, "imu": 1}
+    assert result["first_alarm_modalities"] == {UNATTRIBUTED: 1}
+    assert result["first_alarm_matches_expected"] == 0
+    per_seed = {0: {"models": {"baseline_z": {"test": {"faults": {"k": result}}}}}}
+    assert aggregate_attribution(per_seed)["baseline_z"]["k"]["first_alarm_modalities"] == [
+        UNATTRIBUTED
+    ]
