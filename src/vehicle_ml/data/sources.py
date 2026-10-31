@@ -26,6 +26,7 @@ from vehicle_ml.data.naming import physical_column, unit_suffix
 from vehicle_ml.defs import ble, vehicle_cl250, vehicle_derived
 
 IDENTITY_COLUMNS = ("session_id", "start_ms", "end_ms")
+MODALITIES = ("can", "imu", "other")
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,7 @@ def feature_modalities(columns: Iterable[str]) -> dict[str, str]:
 
 
 __all__ = [
+    "MODALITIES",
     "FeatureMetadata",
     "feature_metadata",
     "feature_modality",

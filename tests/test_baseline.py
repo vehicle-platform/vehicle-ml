@@ -59,3 +59,15 @@ def test_json_round_trip_preserves_scores() -> None:
     assert_frame_equal(model.scores(train), restored.scores(train))
     assert restored.feature_names == model.feature_names
     assert restored.components.shape == model.components.shape
+
+
+def test_per_feature_residuals_and_z_match_the_scores() -> None:
+    train = _features()
+    scaler = Standardizer.fit(train, {"train": ["train"]})
+    model = BaselineModel.fit(train, {"train": ["train"]}, scaler, variance=0.5)
+    scored = model.scores(train)
+    residuals = model.pca_residuals(train)
+    z = model.abs_z(train)
+    assert residuals.shape == z.shape == (len(train), len(model.feature_names))
+    np.testing.assert_allclose(residuals.mean(axis=1), scored["pca_error"].to_numpy())
+    np.testing.assert_allclose(z.max(axis=1), scored["robust_z"].to_numpy())

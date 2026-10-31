@@ -6,6 +6,11 @@ window. The baseline is the ML-16 PCA reconstruction error and robust feature z-
 Thresholds are chosen on **validation healthy sessions** only; test sessions are never
 used for fitting or threshold selection.
 
+Every alarm also records the **modality** that raised it (CLAUDE.md rule 3): the CAN
+physics estimators are modality ``can`` with their estimator group, the PCA baseline is
+attributed to the modality holding the largest share of the window's squared
+reconstruction error, and the robust-z baseline to the modality of its largest |z|.
+
 The output is synthetic-data evidence only. It does not claim generalisation to real
 rides (CLAUDE.md rule 4) and it never feeds a safety partition (invariant 3).
 """
@@ -23,9 +28,10 @@ import numpy as np
 import pandas as pd
 
 from vehicle_ml.baseline import BaselineModel
+from vehicle_ml.data.sources import MODALITIES, feature_metadata, imu_columns
 from vehicle_ml.data.store import SessionStore
 from vehicle_ml.dataset import build_dataset
-from vehicle_ml.defs import defs_version
+from vehicle_ml.defs import defs_version, vehicle_derived
 from vehicle_ml.physics.charging import fit_charging
 from vehicle_ml.physics.config import RoleMap, load_roles
 from vehicle_ml.physics.cooling import fit_cooling
@@ -65,6 +71,12 @@ PHYSICS_FEATURES_BY_ESTIMATOR = {
     "gearing": GEARING_FEATURES,
 }
 MODEL_NAMES = ("physics", "baseline_pca", "baseline_z")
+PHYSICS_MODALITY = "can"
+IMU_BAND_COUNT = 5  # equal-width FFT bands from 0 Hz to the IMU Nyquist frequency
+MISS_NOTE = (
+    "The CAN-only physics models are expected to miss `wheel_vibration`; misses are "
+    "reported as misses and the models are not tuned to catch it (rule 4)."
+)
 SYNTHETIC_NOTE = "synthetic data; no generalisation claim (rule 4)"
 
 
@@ -73,6 +85,21 @@ class EvaluationResult:
     data: dict
     json_path: Path
     markdown_path: Path
+
+
+def _imu_bands() -> dict[str, list[tuple[float, float]]]:
+    """Equal-width FFT bands up to the IMU Nyquist limit, for every defs IMU column."""
+    periods = {
+        int(spec["sample_period_ms"])
+        for name, spec in vehicle_derived.SENSORS.items()
+        if name.startswith("imu_")
+    }
+    if len(periods) != 1:
+        raise ValueError("the defs IMU sensors do not share one sample period")
+    nyquist = 500.0 / periods.pop()
+    edges = np.linspace(0.0, nyquist, IMU_BAND_COUNT + 1)
+    bands = [(float(low), float(high)) for low, high in zip(edges[:-1], edges[1:], strict=True)]
+    return {column: bands for column in imu_columns()}
 
 
 def _load_faults(data_dir: Path) -> dict[str, dict[str, object]]:
@@ -91,7 +118,14 @@ def _load_faults(data_dir: Path) -> dict[str, dict[str, object]]:
         onset = entry.get("onset_ms")
         if not isinstance(fault, str) or not isinstance(onset, (int, float)):
             raise ValueError(f"faults.json: {session_id!r} needs fault and onset_ms")
-        result[str(session_id)] = {"fault": fault, "onset_ms": int(onset)}
+        expected = entry.get("expected_modality")
+        if expected is not None and expected not in MODALITIES:
+            raise ValueError(f"faults.json: {session_id!r} has unknown expected_modality")
+        result[str(session_id)] = {
+            "fault": fault,
+            "onset_ms": int(onset),
+            "expected_modality": expected,
+        }
     return result
 
 
@@ -374,6 +408,55 @@ def _false_alarms(
     }
 
 
+def _top_modality(weights: np.ndarray, modalities: Sequence[str], *, total: bool) -> str:
+    """Modality of the largest per-modality sum (``total``) or largest single entry."""
+    if weights.shape != (len(modalities),):
+        raise ValueError("need exactly one modality per feature")
+    if not np.isfinite(weights).all():
+        return ""
+    if not total:
+        return modalities[int(np.argmax(weights))]
+    names = sorted(set(modalities))
+    sums = [float(np.sum(weights[[m == name for m in modalities]])) for name in names]
+    return names[int(np.argmax(sums))]
+
+
+def pca_alarm_modality(residual_sq: np.ndarray, modalities: Sequence[str]) -> str:
+    """Modality holding the largest share of a window's squared reconstruction error.
+
+    ``residual_sq`` is the per-feature squared residual; ``modalities`` gives each
+    feature's modality. Residuals are summed per modality. Ties go to the alphabetically
+    first modality. A window with a non-finite residual has no attribution (``""``).
+    """
+    return _top_modality(np.asarray(residual_sq, dtype=float), modalities, total=True)
+
+
+def z_alarm_modality(abs_z: np.ndarray, modalities: Sequence[str]) -> str:
+    """Modality of the feature with the largest |z| (``""`` for a non-finite window)."""
+    return _top_modality(np.abs(np.asarray(abs_z, dtype=float)), modalities, total=False)
+
+
+def _modalities_of(feature_names: Sequence[str]) -> list[str]:
+    metadata = feature_metadata(feature_names, allow_unknown=True)
+    return [metadata[name].modality for name in feature_names]
+
+
+def _physics_attribution(scores: pd.DataFrame, group_of: Mapping[str, str]) -> pd.DataFrame:
+    """Physics alarms are CAN; the group is the estimator group with the largest score."""
+    estimators = list(group_of)
+    stacked = np.column_stack(
+        [scores[f"physics_{name}"].to_numpy(dtype=float) for name in estimators]
+    )
+    best = np.argmax(stacked, axis=1)
+    return pd.DataFrame(
+        {
+            "physics_modality": PHYSICS_MODALITY,
+            "physics_group": [group_of[estimators[index]] for index in best],
+        },
+        index=scores.index,
+    )
+
+
 def _fault_results(
     scores: pd.DataFrame,
     model: str,
@@ -381,6 +464,13 @@ def _fault_results(
     test_ids: Sequence[str],
     faults: Mapping[str, dict[str, object]],
 ) -> dict[str, dict[str, object]]:
+    """Per fault kind: detections, delay and the modality of every alarm after onset.
+
+    ``modalities`` counts all alarm windows after onset per modality (the detections);
+    ``first_alarm_modalities`` counts, per session, the modality of its first alarm.
+    ``groups`` is the physics estimator group of the first alarms (empty for the
+    baselines).
+    """
     grouped: dict[str, dict[str, object]] = {}
     for session_id in test_ids:
         truth = faults.get(session_id)
@@ -388,11 +478,22 @@ def _fault_results(
             continue
         kind = str(truth["fault"])
         onset = int(truth["onset_ms"])
+        expected = truth.get("expected_modality")
         rows = scores.loc[scores["session_id"] == session_id].sort_values("start_ms")
         rows = rows.loc[rows["start_ms"] >= onset]
         entry = grouped.setdefault(
             kind,
-            {"sessions": 0, "detected": 0, "missed": 0, "delays_ms": [], "modalities": Counter()},
+            {
+                "sessions": 0,
+                "detected": 0,
+                "missed": 0,
+                "delays_ms": [],
+                "expected_modality": expected,
+                "modalities": Counter(),
+                "first_alarm_modalities": Counter(),
+                "first_alarm_matches_expected": 0,
+                "groups": Counter(),
+            },
         )
         entry["sessions"] = int(entry["sessions"]) + 1
         alarm = rows.loc[rows[model].to_numpy(dtype=float) > threshold]
@@ -402,17 +503,13 @@ def _fault_results(
         first = alarm.iloc[0]
         entry["detected"] = int(entry["detected"]) + 1
         entry["delays_ms"].append(int(first["start_ms"]) - onset)
+        entry["modalities"].update(str(value) for value in alarm[f"{model}_modality"])
+        first_modality = str(first[f"{model}_modality"])
+        entry["first_alarm_modalities"][first_modality] += 1
+        if expected is not None and first_modality == expected:
+            entry["first_alarm_matches_expected"] = int(entry["first_alarm_matches_expected"]) + 1
         if model == "physics":
-            choices = {
-                "cooling": float(first["physics_cooling"]),
-                "charging": float(first["physics_charging"]),
-                "gearing": float(first["physics_gearing"]),
-            }
-            entry["modalities"][max(choices, key=choices.get)] += 1
-        elif model == "baseline_pca":
-            entry["modalities"]["features_pca"] += 1
-        else:
-            entry["modalities"]["features_robust_z"] += 1
+            entry["groups"][str(first["physics_group"])] += 1
 
     result: dict[str, dict[str, object]] = {}
     for kind, entry in sorted(grouped.items()):
@@ -422,9 +519,21 @@ def _fault_results(
             "detected": int(entry["detected"]),
             "missed": int(entry["missed"]),
             "median_delay_ms": float(np.median(delays)) if delays else None,
+            "expected_modality": entry["expected_modality"],
             "modalities": dict(entry["modalities"]),
+            "first_alarm_modalities": dict(entry["first_alarm_modalities"]),
+            "first_alarm_matches_expected": (
+                None
+                if entry["expected_modality"] is None
+                else entry["first_alarm_matches_expected"]
+            ),
+            "groups": dict(entry["groups"]),
         }
     return result
+
+
+def _counts(counter: Mapping[str, int]) -> str:
+    return ", ".join(f"{name}:{count}" for name, count in sorted(counter.items())) or "-"
 
 
 def _markdown(data: dict) -> str:
@@ -466,22 +575,32 @@ def _markdown(data: dict) -> str:
         lines.append("No fault ground truth was found (`faults.json`); false alarms only.")
     else:
         lines += [
-            "| model | fault kind | detected | missed | median delay ms | caught by |",
-            "|---|---|---|---|---|---|",
+            "Modality is the signal group that raised the alarm: CAN (`did.*` / `derived.*`), "
+            "IMU or other. Alarm windows count every window at or after onset above the "
+            "threshold. " + MISS_NOTE,
+            "",
+            "| model | fault kind | expected modality | detected | missed | median delay ms "
+            "| alarm windows by modality | first alarm modality | first alarm = expected "
+            "| first alarm group |",
+            "|---|---|---|---|---|---|---|---|---|---|",
         ]
         for model in MODEL_NAMES:
             faults = data["models"][model]["test"]["faults"]
             if not faults:
-                lines.append(f"| {model} | (none) | 0 | 0 | - | - |")
+                lines.append(f"| {model} | (none) | - | 0 | 0 | - | - | - | - | - |")
                 continue
             for kind, entry in faults.items():
                 delay = (
                     "-" if entry["median_delay_ms"] is None else f"{entry['median_delay_ms']:.0f}"
                 )
-                caught = ", ".join(f"{name}:{count}" for name, count in entry["modalities"].items())
+                matches = entry["first_alarm_matches_expected"]
+                match_text = "unknown" if matches is None else f"{matches}/{entry['detected']}"
                 lines.append(
-                    f"| {model} | {kind} | {entry['detected']}/{entry['sessions']} | "
-                    f"{entry['missed']} | {delay} | {caught or '-'} |"
+                    f"| {model} | {kind} | {entry['expected_modality'] or 'unknown'} | "
+                    f"{entry['detected']}/{entry['sessions']} | {entry['missed']} | {delay} | "
+                    f"{_counts(entry['modalities'])} | "
+                    f"{_counts(entry['first_alarm_modalities'])} | {match_text} | "
+                    f"{_counts(entry['groups'])} |"
                 )
     lines.append("")
     return "\n".join(lines)
@@ -508,12 +627,13 @@ def evaluate(
     result = build_dataset(
         data_path,
         out_path,
-        kinds=("telemetry", "derived"),
+        kinds=("telemetry", "derived", "imu"),
         channels=None,
         window_ms=window_ms,
         stride_ms=stride_ms,
         max_gap_ms=max_gap_ms,
         seed=seed,
+        bands=_imu_bands(),
     )
     if result.features.empty:
         raise ValueError("no windows were built from the data directory")
@@ -536,6 +656,14 @@ def evaluate(
     train_features = result.features.loc[result.features["session_id"].isin(train_healthy)]
     baseline = BaselineModel.fit(train_features, result.split, result.scaler)
     baseline_scores = baseline.scores(result.features)
+    feature_modalities = _modalities_of(baseline.feature_names)
+    pca_modality = [
+        pca_alarm_modality(row, feature_modalities)
+        for row in baseline.pca_residuals(result.features)
+    ]
+    z_modality = [
+        z_alarm_modality(row, feature_modalities) for row in baseline.abs_z(result.features)
+    ]
 
     scores = pd.DataFrame(
         {
@@ -549,8 +677,15 @@ def evaluate(
             "physics_gearing": physics_scores["physics_gearing"].to_numpy(),
             "baseline_pca": baseline_scores["pca_error"].to_numpy(),
             "baseline_z": baseline_scores["robust_z"].to_numpy(),
+            "baseline_pca_modality": pca_modality,
+            "baseline_z_modality": z_modality,
         }
     )
+    attribution = _physics_attribution(
+        scores, {name: roles.group(name) for name in PHYSICS_FEATURES_BY_ESTIMATOR}
+    )
+    scores["physics_modality"] = attribution["physics_modality"].to_numpy()
+    scores["physics_group"] = attribution["physics_group"].to_numpy()
 
     val_healthy = _healthy(result.split["val"], faults)
     thresholds = {
