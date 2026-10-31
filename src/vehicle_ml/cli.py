@@ -8,6 +8,7 @@ from collections.abc import Sequence
 
 from vehicle_ml.data.store import KINDS, SessionStore
 from vehicle_ml.dataset import build_dataset, write_dataset
+from vehicle_ml.evaluate import evaluate
 
 
 def _parse_bands(text: str | None) -> dict[str, list[tuple[float, float]]]:
@@ -48,12 +49,51 @@ def _parser() -> argparse.ArgumentParser:
     dataset.add_argument("--max-gap-ms", type=int, default=500)
     dataset.add_argument("--seed", type=int, default=0)
     dataset.add_argument("--bands", default=None)
+
+    evaluation = commands.add_parser(
+        "evaluate", help="compare the physics and no-physics detectors"
+    )
+    evaluation.add_argument("--data-dir", required=True)
+    evaluation.add_argument("--out", required=True)
+    evaluation.add_argument("--config", required=True)
+    evaluation.add_argument("--seed", type=int, default=0)
+    evaluation.add_argument(
+        "--target-false-alarms-per-hour",
+        type=float,
+        default=1.0,
+        help="target false alarms per hour of healthy riding (default: 1.0)",
+    )
+    evaluation.add_argument("--window-ms", type=int, default=10_000)
+    evaluation.add_argument("--stride-ms", type=int, default=5_000)
+    evaluation.add_argument("--max-gap-ms", type=int, default=500)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command == "evaluate":
+        try:
+            result = evaluate(
+                args.data_dir,
+                args.out,
+                args.config,
+                seed=args.seed,
+                target_false_alarms_per_hour=args.target_false_alarms_per_hour,
+                window_ms=args.window_ms,
+                stride_ms=args.stride_ms,
+                max_gap_ms=args.max_gap_ms,
+            )
+        except ValueError as exc:
+            print(f"vehicle-ml: {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:
+            print(f"vehicle-ml: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        mode = "faults" if result.data["faults_present"] else "false alarms only"
+        print(f"wrote {result.json_path} and {result.markdown_path} ({mode})")
+        return 0
+
     try:
         kinds = [kind.strip() for kind in args.kinds.split(",") if kind.strip()]
         unknown = [kind for kind in kinds if kind not in KINDS]

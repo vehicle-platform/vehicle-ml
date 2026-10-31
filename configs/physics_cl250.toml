@@ -1,0 +1,11 @@
+# Honda CL250 role map for the D-083 stage-1 physics estimators.
+# Names are validated against the pinned vehicle-defs submodule on load.
+# Change this file, not library code, when a vehicle signal differs.
+
+[roles]
+engine_speed = "did.ENGINE_SPEED"
+vehicle_speed = "did.VEHICLE_SPEED"
+coolant_temp = "did.COOLANT_TEMP"
+battery_voltage = "did.BATTERY_VOLTAGE"
+gear_estimate = "derived.gear_estimate"
+gearbox_ratio_measured = "derived.gearbox_ratio_measured"
