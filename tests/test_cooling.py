@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from tests.physics_synthetic import PhysicsSessionSpec, generate_session, healthy_variant
-from vehicle_ml.physics.cooling import NotIdentifiableError, fit_cooling
+from vehicle_ml.physics.cooling import NotIdentifiableError, fit_cooling, fit_cooling_online
 
 
 def _simulate(
@@ -87,3 +87,12 @@ def test_idle_only_data_is_not_identifiable() -> None:
     temperature = 70.0 + 0.002 * times
     with pytest.raises(NotIdentifiableError, match="not identifiable"):
         fit_cooling(times, temperature, rpm)
+
+
+def test_online_fit_matches_the_batch_fit_without_forgetting() -> None:
+    times, temperature, rpm = _simulate()
+    batch = fit_cooling(times, temperature, rpm)
+    online = fit_cooling_online(times, temperature, rpm)
+    assert online.a == pytest.approx(batch.a, abs=1e-4)
+    assert online.h == pytest.approx(batch.h, abs=1e-4)
+    assert online.ambient_c == pytest.approx(batch.ambient_c, abs=1e-3)
