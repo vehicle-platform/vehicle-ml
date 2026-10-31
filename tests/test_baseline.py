@@ -61,6 +61,18 @@ def test_json_round_trip_preserves_scores() -> None:
     assert restored.components.shape == model.components.shape
 
 
+def test_fit_ignores_a_window_with_a_missing_feature() -> None:
+    train = _features(n=6)
+    train.loc[0, "a"] = np.nan
+    scaler = Standardizer.fit(train, {"train": ["train"]})
+    model = BaselineModel.fit(train, {"train": ["train"]}, scaler)
+
+    matrix = scaler.transform(train)[model.feature_names].to_numpy()
+    expected = matrix[1:].mean(axis=0)
+    np.testing.assert_allclose(model.pca_mean, expected)
+    assert np.isnan(model.scores(train).iloc[0]).all()
+
+
 def test_per_feature_residuals_and_z_match_the_scores() -> None:
     train = _features()
     scaler = Standardizer.fit(train, {"train": ["train"]})

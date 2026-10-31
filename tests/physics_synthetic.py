@@ -86,6 +86,7 @@ class PhysicsSessionSpec:
     fault: str | None = None
     onset_ms: int | None = None
     idle_only: bool = False
+    has_imu: bool = True
 
     def __post_init__(self) -> None:
         if self.fault is not None and self.fault not in FAULT_KINDS:
@@ -397,7 +398,11 @@ def generate_session(spec: PhysicsSessionSpec) -> PhysicsSession:
             }
         )
     derived = pd.DataFrame(rows)
-    imu = _imu(spec, times, speed)
+    imu = (
+        _imu(spec, times, speed)
+        if spec.has_imu
+        else pd.DataFrame(columns=["session_id", "device_time_ms", *imu_columns()])
+    )
     truth = FaultTruth(spec.session_id, spec.fault, spec.onset_ms)
     return PhysicsSession(spec, telemetry, derived, imu, truth)
 
@@ -443,7 +448,7 @@ def _write_index(root: Path, specs: tuple[PhysicsSessionSpec, ...]) -> None:
                     packet_count,
                     0.0,
                     "ok",
-                    1,
+                    int(spec.has_imu),
                     DEFS_VERSION,
                     0,
                     1,
@@ -471,7 +476,8 @@ def make_physics_data_dir(
         parquet.mkdir(parents=True, exist_ok=True)
         session.telemetry.to_parquet(parquet / "telemetry.parquet", index=False)
         session.derived.to_parquet(parquet / "derived.parquet", index=False)
-        session.imu.to_parquet(parquet / "imu.parquet", index=False)
+        if spec.has_imu:
+            session.imu.to_parquet(parquet / "imu.parquet", index=False)
         (session_dir / "report.json").write_text(
             json.dumps({"defs_version": DEFS_VERSION}), encoding="utf-8"
         )
