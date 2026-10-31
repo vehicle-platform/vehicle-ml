@@ -24,6 +24,7 @@ if _DEFS_PYTHON.is_dir() and str(_DEFS_PYTHON) not in sys.path:
 try:
     import vehicle_defs  # noqa: E402
     from vehicle_defs import (  # noqa: E402
+        ble,
         vehicle_cl250,
         vehicle_constants,
         vehicle_derived,
@@ -58,4 +59,11 @@ def defs_version() -> str:
         return "unknown"
 
 
-__all__ = ["vehicle_defs", "vehicle_cl250", "vehicle_constants", "vehicle_derived", "defs_version"]
+__all__ = [
+    "ble",
+    "vehicle_defs",
+    "vehicle_cl250",
+    "vehicle_constants",
+    "vehicle_derived",
+    "defs_version",
+]

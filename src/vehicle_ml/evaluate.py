@@ -59,6 +59,11 @@ GEARING_FEATURES = (
     "gearing_residual_max_abs",
     "gearing_residual_positive_fraction",
 )
+PHYSICS_FEATURES_BY_ESTIMATOR = {
+    "cooling": COOLING_FEATURES,
+    "charging": CHARGING_FEATURES,
+    "gearing": GEARING_FEATURES,
+}
 MODEL_NAMES = ("physics", "baseline_pca", "baseline_z")
 SYNTHETIC_NOTE = "synthetic data; no generalisation claim (rule 4)"
 
@@ -264,10 +269,20 @@ def _physics_window(
     return values
 
 
+def physics_feature_groups(roles: RoleMap) -> dict[str, str]:
+    """Estimator group for every physics feature, from the validated role config."""
+    return {
+        feature: roles.group(estimator)
+        for estimator, names in PHYSICS_FEATURES_BY_ESTIMATOR.items()
+        for feature in names
+    }
+
+
 def _physics_features(
     features: pd.DataFrame,
     frames: Mapping[str, pd.DataFrame | None],
     table: GearTable | None,
+    groups: Mapping[str, str] | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, float]] = []
     for row in features.itertuples(index=False):
@@ -276,7 +291,10 @@ def _physics_features(
             rows.append({"cooling_ok": 0.0, "charging_ok": 0.0, "gearing_ok": 0.0})
         else:
             rows.append(_physics_window(frame, int(row.start_ms), int(row.end_ms), table))
-    return pd.DataFrame(rows, index=features.index)
+    result = pd.DataFrame(rows, index=features.index)
+    if groups:
+        result.attrs["feature_groups"] = dict(groups)
+    return result
 
 
 def _robust_z(values: pd.Series, reference: pd.Series) -> pd.Series:
@@ -511,7 +529,7 @@ def evaluate(
             missing_roles[session_id] = missing
 
     table = _fit_gear_table(frames, roles, result.split["train"], faults)
-    physics = _physics_features(result.features, frames, table)
+    physics = _physics_features(result.features, frames, table, physics_feature_groups(roles))
     train_healthy = _healthy(result.split["train"], faults)
     physics_scores = _physics_scores(physics, result.features["session_id"].isin(train_healthy))
 

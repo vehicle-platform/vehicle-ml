@@ -9,3 +9,9 @@ coolant_temp = "did.COOLANT_TEMP"
 battery_voltage = "did.BATTERY_VOLTAGE"
 gear_estimate = "derived.gear_estimate"
 gearbox_ratio_measured = "derived.gearbox_ratio_measured"
+
+# Estimator -> signal group used in the rule-3 attribution.
+[groups]
+cooling = "cooling"
+charging = "charging"
+gearing = "longitudinal"

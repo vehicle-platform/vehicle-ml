@@ -25,6 +25,8 @@ REQUIRED_ROLES = (
     "gear_estimate",
     "gearbox_ratio_measured",
 )
+PHYSICS_ESTIMATORS = ("cooling", "charging", "gearing")
+PHYSICS_GROUPS = ("cooling", "charging", "longitudinal")
 
 
 def _validate_signal(role: str, spec: str) -> tuple[str, str]:
@@ -47,6 +49,7 @@ class RoleMap:
     """Validated role -> vehicle-defs signal mapping."""
 
     roles: Mapping[str, str]
+    groups: Mapping[str, str]
     source: Path | None = None
 
     def signal(self, role: str) -> str:
@@ -74,6 +77,12 @@ class RoleMap:
         if missing:
             raise ValueError(f"role map is missing roles: {', '.join(missing)}")
 
+    def group(self, estimator: str) -> str:
+        try:
+            return self.groups[estimator]
+        except KeyError as exc:
+            raise ValueError(f"estimator {estimator!r} is not in the group map") from exc
+
 
 def load_roles(path: str | Path, required: tuple[str, ...] = REQUIRED_ROLES) -> RoleMap:
     """Load and validate a role config; fail on an unknown defs name or a missing role."""
@@ -98,7 +107,27 @@ def load_roles(path: str | Path, required: tuple[str, ...] = REQUIRED_ROLES) -> 
     if missing:
         raise ValueError(f"{config_path}: missing required roles: {', '.join(missing)}")
 
-    return RoleMap(roles=roles, source=config_path)
+    raw_groups = data.get("groups")
+    if not isinstance(raw_groups, dict):
+        raise ValueError(f"{config_path}: expected a [groups] table")
+    groups: dict[str, str] = {}
+    for estimator, group in raw_groups.items():
+        if not isinstance(estimator, str) or estimator not in PHYSICS_ESTIMATORS:
+            raise ValueError(f"{config_path}: unknown estimator group {estimator!r}")
+        if not isinstance(group, str) or group not in PHYSICS_GROUPS:
+            raise ValueError(f"{config_path}: estimator {estimator!r} has unknown group {group!r}")
+        groups[estimator] = group
+    missing_groups = [name for name in PHYSICS_ESTIMATORS if name not in groups]
+    if missing_groups:
+        raise ValueError(f"{config_path}: missing estimator groups: {', '.join(missing_groups)}")
+
+    return RoleMap(roles=roles, groups=groups, source=config_path)
 
 
-__all__ = ["REQUIRED_ROLES", "RoleMap", "load_roles"]
+__all__ = [
+    "PHYSICS_ESTIMATORS",
+    "PHYSICS_GROUPS",
+    "REQUIRED_ROLES",
+    "RoleMap",
+    "load_roles",
+]
