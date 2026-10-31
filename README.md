@@ -101,18 +101,36 @@ Nyquist frequency given by the defs IMU `sample_period_ms`). Each alarm records:
 
 - physics: modality `can` and the estimator group (`cooling`, `charging`,
   `longitudinal`) from `[groups]` in the role config;
-- PCA baseline: the modality holding the largest share of the window's squared
-  reconstruction error (per-feature residuals summed per modality);
-- robust-z baseline: the modality of the feature with the largest |z|.
+- PCA baseline: the modality with the largest ratio of its window's summed squared
+  reconstruction error to its mean summed squared residual on the healthy training
+  windows. The ratio is used because the raw sum favours the modality with more features
+  (the IMU has six axes times statistics and FFT bands); the means are fitted once from
+  the same healthy training windows as the baseline, never from validation or test. A
+  modality with a zero or non-finite training mean is skipped;
+- robust-z baseline: the modality of the feature with the largest |z|; |z| is already
+  scale-free per feature, so it is not normalised again.
 
 The report has one row per model and fault kind: expected modality, detections, alarm
 windows per modality, the modality of the first alarm after onset and whether it equals
-the expected one. A model that does not alarm is reported as a miss.
+the expected one. A model that does not alarm is reported as a miss. A fault session
+whose windows were all unscored by a baseline is reported as "not evaluated" for that
+baseline, not as a miss.
 
 The synthetic `wheel_vibration` scenario is the rule-3 weak-CAN case: from onset a
 narrow-band line appears in `imu_accel_z` at 4x the rear-wheel rotation frequency, while
 every CAN and derived column stays identical to the healthy session with the same seed.
 The CAN-only physics models are expected to miss it, and they are not tuned to catch it.
+
+### Sessions without IMU
+
+`build_dataset` still picks a time base per session, so a session with no IMU file gets
+a telemetry base and no IMU feature values. The baseline scaler and both baseline
+detectors are fitted only on healthy training windows that have every baseline feature.
+A window missing any baseline feature gets no baseline score (NaN) and is reported as
+**"not scored (missing modality)"**; it is never a detection, a miss or a false alarm.
+The CAN-only physics models still score it. `evaluation.json` / `evaluation.md` list the
+sessions and windows per split in `baseline_unscored` with the missing modality, and the
+dataset card's modality availability table marks the session's `imu` column false.
 
 ### Several split seeds
 
@@ -122,6 +140,13 @@ only the split, never the data. Per-seed reports go to `<out>/seed-<n>/`; the to
 `evaluation.json` / `evaluation.md` hold every per-seed result plus the mean, min and max
 of each metric over the seeds that produced it. A fault kind that is in the test split
 for only some seeds is aggregated over those seeds (the report states how many).
+
+The aggregate also has an **attribution stability** table: for every model and fault
+kind it lists the first-alarm modality per seed, how many seeds match
+`expected_modality`, and the matching fraction. A seed with no alarm is `no alarm`, an
+all-unscored seed is `not evaluated`, and a seed whose test sessions disagree is
+`mixed`; none of these is a match. The fraction denominator is every seed that had the
+fault kind in its test split.
 
 Role config and defs bridge:
 
