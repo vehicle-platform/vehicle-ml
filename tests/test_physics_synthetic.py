@@ -89,6 +89,16 @@ def test_data_dir_has_the_server_layout_and_truth(tmp_path: Path) -> None:
     assert dataset.truths()["phys-00"].kind is None
 
 
+def test_session_without_imu_writes_no_imu_file(tmp_path: Path) -> None:
+    spec = PhysicsSessionSpec("phys-no-imu", seed=1, has_imu=False)
+    dataset = make_physics_data_dir(tmp_path / "data", (spec,))
+    store = SessionStore(dataset.root)
+
+    assert dataset.sessions[0].imu.empty
+    assert not store.sessions()["has_imu"].iloc[0]
+    assert store.load("phys-no-imu", "imu") is None
+
+
 def test_wheel_vibration_leaves_can_and_derived_identical_to_the_healthy_twin() -> None:
     spec = PhysicsSessionSpec("phys-test", seed=5, fault="wheel_vibration", onset_ms=30_000)
     faulty = generate_session(spec)

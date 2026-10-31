@@ -398,11 +398,12 @@ def _false_alarms(
     hours = 0.0
     for session_id in session_ids:
         rows = scores.loc[scores["session_id"] == session_id].sort_values("start_ms")
-        if rows.empty:
+        scored = rows.loc[rows[model].notna()]
+        if scored.empty:
             continue
-        mask = rows[model].to_numpy(dtype=float) > threshold
+        mask = scored[model].to_numpy(dtype=float) > threshold
         episodes += _episodes(mask)
-        hours += float(rows["end_ms"].max() - rows["start_ms"].min()) / 3_600_000.0
+        hours += float(scored["end_ms"].max() - scored["start_ms"].min()) / 3_600_000.0
     return {
         "episodes": float(episodes),
         "hours": hours,
@@ -508,6 +509,47 @@ def _baseline_feature_names(features: pd.DataFrame) -> list[str]:
     ]
 
 
+def _baseline_unscored(
+    features: pd.DataFrame,
+    baseline: BaselineModel,
+    modalities: Sequence[str],
+    split: Mapping[str, Sequence[str]],
+) -> dict[str, list[dict[str, object]]]:
+    """Sessions/windows without every baseline feature, with the missing modalities."""
+    matrix = features[baseline.feature_names].to_numpy(dtype=float)
+    complete = np.isfinite(matrix).all(axis=1)
+    result: dict[str, list[dict[str, object]]] = {}
+    for part, session_ids in split.items():
+        allowed = set(session_ids)
+        entries: dict[str, dict[str, object]] = {}
+        for index in np.flatnonzero(~complete):
+            session_id = str(features["session_id"].iloc[index])
+            if session_id not in allowed:
+                continue
+            missing = sorted(
+                {
+                    modality
+                    for position, modality in enumerate(modalities)
+                    if not np.isfinite(matrix[index, position])
+                }
+            )
+            entry = entries.setdefault(
+                session_id,
+                {"session_id": session_id, "windows": 0, "missing_modalities": set()},
+            )
+            entry["windows"] = int(entry["windows"]) + 1
+            entry["missing_modalities"].update(missing)
+        result[part] = [
+            {
+                "session_id": session_id,
+                "windows": int(entries[session_id]["windows"]),
+                "missing_modalities": sorted(entries[session_id]["missing_modalities"]),
+            }
+            for session_id in sorted(entries)
+        ]
+    return result
+
+
 def _fit_baseline(
     features: pd.DataFrame,
     split_manifest: Mapping[str, Sequence[str]],
@@ -576,6 +618,7 @@ def _fault_results(
                 "sessions": 0,
                 "detected": 0,
                 "missed": 0,
+                "not_evaluated": 0,
                 "delays_ms": [],
                 "expected_modality": expected,
                 "modalities": Counter(),
@@ -585,7 +628,11 @@ def _fault_results(
             },
         )
         entry["sessions"] = int(entry["sessions"]) + 1
-        alarm = rows.loc[rows[model].to_numpy(dtype=float) > threshold]
+        scored = rows.loc[rows[model].notna()]
+        if scored.empty:
+            entry["not_evaluated"] = int(entry["not_evaluated"]) + 1
+            continue
+        alarm = scored.loc[scored[model].to_numpy(dtype=float) > threshold]
         if alarm.empty:
             entry["missed"] = int(entry["missed"]) + 1
             continue
@@ -607,6 +654,7 @@ def _fault_results(
             "sessions": int(entry["sessions"]),
             "detected": int(entry["detected"]),
             "missed": int(entry["missed"]),
+            "not_evaluated": int(entry["not_evaluated"]),
             "median_delay_ms": float(np.median(delays)) if delays else None,
             "expected_modality": entry["expected_modality"],
             "modalities": dict(entry["modalities"]),
@@ -643,6 +691,27 @@ def _markdown(data: dict) -> str:
     ]
     for part, sessions in data["split"].items():
         lines.append(f"| {part} | {len(sessions)} |")
+    lines += [
+        "",
+        "## Baseline coverage",
+        "",
+        "A window without every baseline feature is not scored (missing modality); it is "
+        "never counted as a detection, a miss or a false alarm. The physics models still "
+        "score it.",
+        "",
+        "| split | session | unscored windows | missing modalities |",
+        "|---|---|---|---|",
+    ]
+    for part in data["split"]:
+        entries = data.get("baseline_unscored", {}).get(part, [])
+        if not entries:
+            lines.append(f"| {part} | (none) | 0 | - |")
+            continue
+        for entry in entries:
+            lines.append(
+                f"| {part} | {entry['session_id']} | {entry['windows']} | "
+                f"{', '.join(entry['missing_modalities'])} |"
+            )
     lines += ["", "## Thresholds", "", "| model | threshold |", "|---|---|"]
     for model in MODEL_NAMES:
         lines.append(f"| {model} | {data['thresholds'][model]:.6g} |")
@@ -680,15 +749,15 @@ def _markdown(data: dict) -> str:
             "IMU or other. Alarm windows count every window at or after onset above the "
             "threshold. " + MISS_NOTE,
             "",
-            "| model | fault kind | expected modality | detected | missed | median delay ms "
-            "| alarm windows by modality | first alarm modality | first alarm = expected "
-            "| first alarm group |",
-            "|---|---|---|---|---|---|---|---|---|---|",
+            "| model | fault kind | expected modality | detected | missed | not evaluated "
+            "| median delay ms | alarm windows by modality | first alarm modality "
+            "| first alarm = expected | first alarm group |",
+            "|---|---|---|---|---|---|---|---|---|---|---|",
         ]
         for model in MODEL_NAMES:
             faults = data["models"][model]["test"]["faults"]
             if not faults:
-                lines.append(f"| {model} | (none) | - | 0 | 0 | - | - | - | - | - |")
+                lines.append(f"| {model} | (none) | - | 0 | 0 | 0 | - | - | - | - | - |")
                 continue
             for kind, entry in faults.items():
                 delay = (
@@ -698,7 +767,8 @@ def _markdown(data: dict) -> str:
                 match_text = "unknown" if matches is None else f"{matches}/{entry['detected']}"
                 lines.append(
                     f"| {model} | {kind} | {entry['expected_modality'] or 'unknown'} | "
-                    f"{entry['detected']}/{entry['sessions']} | {entry['missed']} | {delay} | "
+                    f"{entry['detected']}/{entry['sessions']} | {entry['missed']} | "
+                    f"{entry['not_evaluated']} | {delay} | "
                     f"{_counts(entry['modalities'])} | "
                     f"{_counts(entry['first_alarm_modalities'])} | {match_text} | "
                     f"{_counts(entry['groups'])} |"
@@ -757,6 +827,9 @@ def evaluate(
     baseline = _fit_baseline(result.features, result.split, train_healthy)
     baseline_scores = baseline.scores(result.features)
     feature_modalities = _modalities_of(baseline.feature_names)
+    baseline_unscored = _baseline_unscored(
+        result.features, baseline, feature_modalities, result.split
+    )
     pca_training_mean_sq = pca_training_means(
         baseline, result.features, feature_modalities, train_healthy
     )
@@ -828,6 +901,7 @@ def evaluate(
         "threshold_sessions": val_healthy,
         "thresholds": thresholds,
         "pca_modality_training_mean_sq": pca_training_mean_sq,
+        "baseline_unscored": baseline_unscored,
         "models": models,
         "faults_present": bool(faults),
         "missing_roles": missing_roles,

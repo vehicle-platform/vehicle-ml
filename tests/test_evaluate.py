@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from tests.physics_synthetic import IMU_PERIOD_MS, PhysicsDataset, make_physics_data_dir
+from tests.physics_synthetic import (
+    DEFAULT_PHYSICS_SESSIONS,
+    IMU_PERIOD_MS,
+    PhysicsDataset,
+    make_physics_data_dir,
+)
 from vehicle_ml.baseline import BaselineModel
 from vehicle_ml.cli import main
 from vehicle_ml.data.sources import imu_columns
+from vehicle_ml.data.store import SessionStore
+from vehicle_ml.dataset import build_dataset, write_dataset
 from vehicle_ml.evaluate import (
     MISS_NOTE,
     MODEL_NAMES,
@@ -34,6 +42,18 @@ CONFIG = Path(__file__).resolve().parents[1] / "configs" / "physics_cl250.toml"
 def _dataset(tmp_path: Path) -> tuple[Path, PhysicsDataset]:
     root = tmp_path / "data"
     dataset = make_physics_data_dir(root)
+    dataset.write_faults(root / "faults.json")
+    return root, dataset
+
+
+def _mixed_imu_dataset(tmp_path: Path) -> tuple[Path, PhysicsDataset]:
+    missing = {"phys-00", "phys-05", "phys-10", "phys-27"}
+    specs = tuple(
+        replace(spec, has_imu=False) if spec.session_id in missing else spec
+        for spec in DEFAULT_PHYSICS_SESSIONS
+    )
+    root = tmp_path / "mixed"
+    dataset = make_physics_data_dir(root, specs)
     dataset.write_faults(root / "faults.json")
     return root, dataset
 
@@ -72,8 +92,15 @@ def test_evaluate_writes_reports_and_per_fault_metrics(tmp_path: Path) -> None:
         assert {"episodes", "hours", "per_hour"} <= set(test["false_alarms"])
         assert set(test["faults"]) == expected
         for entry in test["faults"].values():
-            assert {"sessions", "detected", "missed", "median_delay_ms", "modalities"} <= set(entry)
-            assert entry["detected"] + entry["missed"] == entry["sessions"]
+            assert {
+                "sessions",
+                "detected",
+                "missed",
+                "not_evaluated",
+                "median_delay_ms",
+                "modalities",
+            } <= set(entry)
+            assert entry["detected"] + entry["missed"] + entry["not_evaluated"] == entry["sessions"]
     assert data["models"]["physics"]["test"]["faults"]
 
 
@@ -259,6 +286,47 @@ def test_attribution_per_modality_and_group_on_the_weak_can_data(tmp_path: Path)
     for model in ("baseline_pca", "baseline_z"):
         for entry in data["models"][model]["test"]["faults"].values():
             assert entry["groups"] == {}
+
+
+def test_sessions_without_imu_are_unscored_but_physics_scores(tmp_path: Path) -> None:
+    root, _ = _mixed_imu_dataset(tmp_path)
+    result = evaluate(root, tmp_path / "out", CONFIG)
+    data = result.data
+
+    unscored = data["baseline_unscored"]
+    assert [entry["session_id"] for entry in unscored["train"]] == ["phys-00"]
+    assert {entry["session_id"] for entry in unscored["test"]} == {"phys-10", "phys-27"}
+    assert {entry["session_id"] for entry in unscored["val"]} == {"phys-05"}
+    for part in ("train", "val", "test"):
+        for entry in unscored[part]:
+            assert entry["missing_modalities"] == ["imu"]
+            assert entry["windows"] > 0
+
+    physics_fault = data["models"]["physics"]["test"]["faults"]["wheel_vibration"]
+    assert physics_fault["sessions"] == 1
+    assert physics_fault["not_evaluated"] == 0
+    assert physics_fault["detected"] + physics_fault["missed"] == 1
+
+    for model in ("baseline_pca", "baseline_z"):
+        entry = data["models"][model]["test"]["faults"]["wheel_vibration"]
+        assert entry["not_evaluated"] == 1
+        assert entry["detected"] == 0
+        assert entry["missed"] == 0
+        assert entry["detected"] + entry["missed"] + entry["not_evaluated"] == entry["sessions"]
+
+    text = result.markdown_path.read_text(encoding="utf-8")
+    assert "not scored (missing modality)" in text
+    assert "not evaluated" in text
+    assert "phys-27" in text
+
+    card_out = tmp_path / "card"
+    dataset = build_dataset(root, card_out, kinds=("telemetry", "derived", "imu"), seed=0)
+    write_dataset(dataset, card_out, SessionStore(root).sessions(), ("telemetry", "derived", "imu"))
+    card = (card_out / "dataset.md").read_text(encoding="utf-8")
+    assert "| phys-00 | False |" in card
+    assert "| phys-05 | False |" in card
+    assert "| phys-27 | False |" in card
+    assert "| phys-01 | True |" in card
 
 
 def test_report_has_the_per_modality_table_and_the_synthetic_sentence(tmp_path: Path) -> None:
