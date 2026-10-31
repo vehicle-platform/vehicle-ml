@@ -5,12 +5,16 @@ The generated sessions use the same lumped equations as the stage-1 estimators:
 - cooling: ``dT/dt = a * q(rpm) - h_eff * (T - T_amb)`` with ``q = rpm / 6000``;
 - charging: a piecewise-linear voltage with a slope below the cut-in RPM and a plateau;
 - gearing: one measured ratio per gear (the defs ``gear_ratio_<n>`` constants), with an
-  optional clutch-slip multiplier.
+  optional clutch-slip multiplier;
+- IMU: broadband road noise on all six axes, plus (``wheel_vibration`` only) a
+  narrow-band line in ``imu_accel_z`` locked to the wheel rotation frequency.
 
 The files mirror the vehicle-server storage layout used by ``tests/synthetic.py``.
 Every value is synthetic; no real ride data or position is written. A fault changes
 only its physical parameter after ``onset_ms``, so a healthy and a faulty session with
-the same seed are identical before the onset.
+the same seed are identical before the onset. ``wheel_vibration`` is the rule-3
+weak-CAN case: it changes only the IMU, so every CAN and derived column equals the
+healthy twin with the same seed (the IMU noise has its own random stream).
 """
 
 from __future__ import annotations
@@ -24,7 +28,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from vehicle_ml.defs import vehicle_constants
+from vehicle_ml.data.sources import imu_columns, sensor_column
+from vehicle_ml.defs import ble, vehicle_constants, vehicle_derived
 
 BASE_UTC = datetime(2026, 10, 15, 9, 0, 0, tzinfo=UTC)
 DEFS_VERSION = "0.20.0"
@@ -35,7 +40,32 @@ FAULT_KINDS = (
     "fan_failure",
     "plateau_sag",
     "clutch_slip",
+    "wheel_vibration",
 )
+
+# What each fault kind is expected to show up on (rule 3); written to faults.json.
+EXPECTED_MODALITY = {
+    "thermostat_stuck_open": "can",
+    "fan_failure": "can",
+    "plateau_sag": "can",
+    "clutch_slip": "can",
+    "wheel_vibration": "imu",
+}
+
+# IMU layout and rate come from defs (invariant 2): sensor names from
+# ``vehicle_derived.SENSORS``, the 10 ms period from their ``sample_period_ms``.
+IMU_ACCEL_Z = "imu_accel_z"
+IMU_PERIOD_MS = int(vehicle_derived.SENSORS[IMU_ACCEL_Z]["sample_period_ms"])
+IMU_NYQUIST_HZ = 500.0 / IMU_PERIOD_MS
+# The wheel_vibration line sits at this multiple of the rear-wheel rotation frequency
+# (4th order, e.g. a four-lobe out-of-round wheel or tyre). At the generated speeds
+# (at most ~70 km/h, wheel rotation <= ~10 Hz) the line stays at ~8-40 Hz, below the
+# 50 Hz Nyquist limit of the 10 ms IMU period; a larger multiple would alias.
+WHEEL_ORDER = 4
+VIBRATION_AMPLITUDE_G = 0.15
+ROAD_NOISE_ACCEL_G = 0.05
+ROAD_NOISE_GYRO_DPS = 1.0
+IMU_STREAM = 1  # SeedSequence entropy word: the IMU noise never shares the CAN stream
 
 # The gearbox ratios come from defs (invariant 2); only the speed bands are synthetic,
 # one per gear so every gear appears at the generated speeds (at most ~70 km/h).
@@ -78,6 +108,7 @@ class PhysicsSession:
     spec: PhysicsSessionSpec
     telemetry: pd.DataFrame
     derived: pd.DataFrame
+    imu: pd.DataFrame
     truth: FaultTruth
 
 
@@ -94,7 +125,11 @@ class PhysicsDataset:
         target = Path(path)
         payload = {
             "sessions": {
-                truth.session_id: {"fault": truth.kind, "onset_ms": truth.onset_ms}
+                truth.session_id: {
+                    "fault": truth.kind,
+                    "onset_ms": truth.onset_ms,
+                    "expected_modality": EXPECTED_MODALITY[truth.kind],
+                }
                 for truth in self.truths().values()
                 if truth.kind is not None
             }
@@ -139,6 +174,31 @@ DEFAULT_PHYSICS_SESSIONS: tuple[PhysicsSessionSpec, ...] = (
     PhysicsSessionSpec("phys-13", seed=13, ambient_c=22.0, load=1.0),
     PhysicsSessionSpec(
         "phys-14", seed=14, ambient_c=26.0, load=0.8, fault="fan_failure", onset_ms=30_000
+    ),
+    # Sessions 15-27 add the weak-CAN fault; the ids put one wheel_vibration session in the
+    # test split for split seeds 0, 1 and 2.
+    PhysicsSessionSpec("phys-15", seed=15, ambient_c=23.0, load=1.1),
+    PhysicsSessionSpec(
+        "phys-16", seed=16, ambient_c=16.0, load=0.8, fault="wheel_vibration", onset_ms=30000
+    ),
+    PhysicsSessionSpec("phys-17", seed=17, ambient_c=23.0, load=1.1),
+    PhysicsSessionSpec("phys-18", seed=18, ambient_c=16.0, load=0.8),
+    PhysicsSessionSpec(
+        "phys-19", seed=19, ambient_c=23.0, load=1.1, fault="wheel_vibration", onset_ms=25000
+    ),
+    PhysicsSessionSpec("phys-20", seed=20, ambient_c=16.0, load=0.8),
+    PhysicsSessionSpec("phys-21", seed=21, ambient_c=23.0, load=1.1),
+    PhysicsSessionSpec(
+        "phys-22", seed=22, ambient_c=16.0, load=0.8, fault="wheel_vibration", onset_ms=30000
+    ),
+    PhysicsSessionSpec("phys-23", seed=23, ambient_c=23.0, load=1.1),
+    PhysicsSessionSpec("phys-24", seed=24, ambient_c=16.0, load=0.8),
+    PhysicsSessionSpec("phys-25", seed=25, ambient_c=23.0, load=1.1),
+    PhysicsSessionSpec(
+        "phys-26", seed=26, ambient_c=16.0, load=0.8, fault="wheel_vibration", onset_ms=25000
+    ),
+    PhysicsSessionSpec(
+        "phys-27", seed=27, ambient_c=23.0, load=1.1, fault="wheel_vibration", onset_ms=30000
     ),
 )
 
@@ -245,6 +305,53 @@ def _gearing(
     return gear, ratio + rng.normal(0.0, 0.005, ratio.shape)
 
 
+def wheel_rotation_hz(speed_kmh: np.ndarray) -> np.ndarray:
+    """Rear-wheel rotation frequency ``speed / (2 * pi * r)`` from the defs radius."""
+    radius_m = vehicle_constants.CONSTANTS["rear_wheel_radius_dynamic_m"][0]
+    return (speed_kmh / 3.6) / (2.0 * np.pi * radius_m)
+
+
+def _imu(spec: PhysicsSessionSpec, times: np.ndarray, speed: np.ndarray) -> pd.DataFrame:
+    """IMU frame in the server layout of ``tests/synthetic.py``."""
+    imu_times = np.arange(0, spec.duration_ms + 1, IMU_PERIOD_MS, dtype=np.int64)
+    rng = np.random.default_rng([spec.seed, IMU_STREAM])
+    columns = imu_columns()
+    values: dict[str, np.ndarray] = {}
+    for column in columns:
+        sigma = ROAD_NOISE_ACCEL_G if column.endswith("_g") else ROAD_NOISE_GYRO_DPS
+        values[column] = rng.normal(0.0, sigma, imu_times.shape)
+    values[sensor_column(IMU_ACCEL_Z)] += 1.0  # gravity on the vertical axis
+
+    if spec.fault == "wheel_vibration":
+        assert spec.onset_ms is not None
+        line_hz = WHEEL_ORDER * wheel_rotation_hz(np.interp(imu_times, times, speed))
+        if float(np.max(line_hz)) >= IMU_NYQUIST_HZ:
+            raise ValueError("wheel_vibration line would alias above the IMU Nyquist limit")
+        phase = 2.0 * np.pi * np.cumsum(line_hz) * (IMU_PERIOD_MS / 1000.0)
+        line = VIBRATION_AMPLITUDE_G * np.sin(phase)
+        values[sensor_column(IMU_ACCEL_Z)] += np.where(imu_times >= spec.onset_ms, line, 0.0)
+
+    scale = ble.SCHEMA["imuBlock"]["scale"]
+    count = imu_times.size
+    data: dict[str, object] = {
+        "session_id": [spec.session_id] * count,
+        "rx_utc": [_iso(int(t)) for t in imu_times],
+        "rx_mono_ms": imu_times,
+        "block_seq": imu_times // 100,
+        "block_flags": np.zeros(count, dtype=np.int64),
+        "block_missing_samples": np.zeros(count, dtype=np.int64),
+        "sample_index": imu_times // IMU_PERIOD_MS,
+        "device_time_ms": imu_times,
+    }
+    for column in columns:
+        field = column.split("_")[0]
+        kind = "accel" if field.startswith("a") else "gyro"
+        data[f"{field}_raw"] = np.round(values[column] * scale[kind]["lsbPerUnit"]).astype(np.int64)
+    for column in columns:
+        data[column] = values[column]
+    return pd.DataFrame(data)
+
+
 def generate_session(spec: PhysicsSessionSpec) -> PhysicsSession:
     """Generate one session from its physical parameters and injected fault."""
     times = _times(spec.duration_ms)
@@ -290,8 +397,9 @@ def generate_session(spec: PhysicsSessionSpec) -> PhysicsSession:
             }
         )
     derived = pd.DataFrame(rows)
+    imu = _imu(spec, times, speed)
     truth = FaultTruth(spec.session_id, spec.fault, spec.onset_ms)
-    return PhysicsSession(spec, telemetry, derived, truth)
+    return PhysicsSession(spec, telemetry, derived, imu, truth)
 
 
 def _iso(ms: int) -> str:
@@ -335,7 +443,7 @@ def _write_index(root: Path, specs: tuple[PhysicsSessionSpec, ...]) -> None:
                     packet_count,
                     0.0,
                     "ok",
-                    0,
+                    1,
                     DEFS_VERSION,
                     0,
                     1,
@@ -363,6 +471,7 @@ def make_physics_data_dir(
         parquet.mkdir(parents=True, exist_ok=True)
         session.telemetry.to_parquet(parquet / "telemetry.parquet", index=False)
         session.derived.to_parquet(parquet / "derived.parquet", index=False)
+        session.imu.to_parquet(parquet / "imu.parquet", index=False)
         (session_dir / "report.json").write_text(
             json.dumps({"defs_version": DEFS_VERSION}), encoding="utf-8"
         )

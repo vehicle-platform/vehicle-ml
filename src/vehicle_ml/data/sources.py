@@ -77,6 +77,26 @@ _DERIVED_COLUMNS = {name: name for name in vehicle_derived.SIGNALS}
 _SENSOR_COLUMNS = _sensor_columns()
 
 
+def sensor_column(sensor: str) -> str:
+    """The server's scaled column for a defs sensor, e.g. ``imu_accel_z`` -> ``az_g``.
+
+    Raises ``ValueError`` naming the sensor when it has no server column.
+    """
+    candidates = [column for column, name in _SENSOR_COLUMNS.items() if name == sensor]
+    if not candidates:
+        raise ValueError(f"sensor {sensor!r} has no server column")
+    return max(candidates, key=len)
+
+
+def imu_columns() -> list[str]:
+    """Scaled server columns of every ``sensor.imu_*`` defs sensor, in defs order."""
+    return [
+        sensor_column(sensor)
+        for sensor in vehicle_derived.SENSORS
+        if feature_modality(f"sensor.{sensor}") == "imu"
+    ]
+
+
 def _channel(column: str) -> str:
     return column.partition(".")[0]
 
@@ -148,4 +168,6 @@ __all__ = [
     "feature_modalities",
     "feature_source",
     "feature_sources",
+    "imu_columns",
+    "sensor_column",
 ]
