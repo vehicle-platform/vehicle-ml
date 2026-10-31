@@ -105,21 +105,40 @@ class BaselineModel:
             raise ValueError(f"missing feature columns: {', '.join(missing)}")
         return self.scaler.transform(features)[self.feature_names].to_numpy(dtype=float)
 
-    def scores(self, features: pd.DataFrame) -> pd.DataFrame:
-        """Per-window PCA reconstruction error and maximum robust z-score."""
+    def pca_residuals(self, features: pd.DataFrame) -> np.ndarray:
+        """Per-feature squared PCA reconstruction residual, one row per window.
+
+        A row with a non-finite feature is all NaN, like its score. The mean of a row
+        is that window's ``pca_error``.
+        """
         matrix = self._matrix(features)
         finite = np.isfinite(matrix).all(axis=1)
-        pca_error = np.full(matrix.shape[0], np.nan, dtype=float)
-        robust_z = np.full(matrix.shape[0], np.nan, dtype=float)
-
+        residuals = np.full(matrix.shape, np.nan, dtype=float)
         if finite.any():
             centred = matrix[finite] - self.pca_mean
             reconstructed = centred @ self.components.T @ self.components
-            pca_error[finite] = np.mean((centred - reconstructed) ** 2, axis=1)
+            residuals[finite] = (centred - reconstructed) ** 2
+        return residuals
 
-            z = np.abs((matrix[finite] - self.median) / self.scale)
-            robust_z[finite] = np.max(z, axis=1)
+    def abs_z(self, features: pd.DataFrame) -> np.ndarray:
+        """Per-feature robust ``|z|``, one row per window (NaN rows as in the residuals)."""
+        matrix = self._matrix(features)
+        finite = np.isfinite(matrix).all(axis=1)
+        z = np.full(matrix.shape, np.nan, dtype=float)
+        if finite.any():
+            z[finite] = np.abs((matrix[finite] - self.median) / self.scale)
+        return z
 
+    def scores(self, features: pd.DataFrame) -> pd.DataFrame:
+        """Per-window PCA reconstruction error and maximum robust z-score."""
+        residuals = self.pca_residuals(features)
+        z = self.abs_z(features)
+        finite = np.isfinite(residuals).all(axis=1)
+        pca_error = np.full(residuals.shape[0], np.nan, dtype=float)
+        robust_z = np.full(residuals.shape[0], np.nan, dtype=float)
+        if finite.any():
+            pca_error[finite] = np.mean(residuals[finite], axis=1)
+            robust_z[finite] = np.max(z[finite], axis=1)
         return pd.DataFrame({"pca_error": pca_error, "robust_z": robust_z}, index=features.index)
 
     def to_json(self) -> str:

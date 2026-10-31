@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from vehicle_ml.data.sources import feature_metadata
 from vehicle_ml.windows import DropReport, Window
 
 IDENTITY_COLUMNS = ("session_id", "start_ms", "end_ms")
@@ -98,6 +99,8 @@ def features_frame(
     bands: Mapping[str, Sequence[tuple[float, float]]] | None = None,
     rate_tolerance: float = 0.05,
     report: DropReport | None = None,
+    *,
+    allow_unknown: bool = False,
 ) -> pd.DataFrame:
     """One row per window: ``IDENTITY_COLUMNS`` plus the feature columns.
 
@@ -120,4 +123,18 @@ def features_frame(
         }
         row.update(features)
         rows.append(row)
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    metadata = feature_metadata(frame.columns, allow_unknown=allow_unknown)
+    frame.attrs["feature_metadata"] = {
+        column: {
+            "source": entry.source,
+            "modality": entry.modality,
+            "group": entry.group,
+        }
+        for column, entry in metadata.items()
+    }
+    frame.attrs["feature_sources"] = {column: entry.source for column, entry in metadata.items()}
+    frame.attrs["feature_modalities"] = {
+        column: entry.modality for column, entry in metadata.items()
+    }
+    return frame

@@ -76,7 +76,7 @@ def _is_metadata(name: str) -> bool:
     return (
         name in _METADATA_COLUMNS
         or name in _TESTER_STATS
-        or name.endswith(("_age_ms", "_valid"))
+        or name.endswith(("_age_ms", "_valid", "_raw"))
         or name.startswith("can_")
         or name == "unanswered_did_count"
     )
@@ -192,7 +192,11 @@ def _session_windows(
         stride_ms=stride_ms,
         max_gap_ms=max_gap_ms,
     )
-    frame = features_frame(windows, bands, report=report) if windows else pd.DataFrame()
+    frame = (
+        features_frame(windows, bands, report=report, allow_unknown=True)
+        if windows
+        else pd.DataFrame()
+    )
     return _SessionData(frame, report, channels_by_kind, excluded, base_kind)
 
 
