@@ -8,8 +8,9 @@ used for fitting or threshold selection.
 
 Every alarm also records the **modality** that raised it (CLAUDE.md rule 3): the CAN
 physics estimators are modality ``can`` with their estimator group, the PCA baseline is
-attributed to the modality holding the largest share of the window's squared
-reconstruction error, and the robust-z baseline to the modality of its largest |z|.
+attributed to the modality with the largest ratio of its window's summed squared
+reconstruction error to its healthy-training mean, and the robust-z baseline to the
+modality of its largest |z|.
 
 The output is synthetic-data evidence only. It does not claim generalisation to real
 rides (CLAUDE.md rule 4) and it never feeds a safety partition (invariant 3).
@@ -32,6 +33,7 @@ from vehicle_ml.data.sources import MODALITIES, feature_metadata, imu_columns
 from vehicle_ml.data.store import SessionStore
 from vehicle_ml.dataset import build_dataset
 from vehicle_ml.defs import defs_version, vehicle_derived
+from vehicle_ml.normalize import Standardizer
 from vehicle_ml.physics.charging import fit_charging
 from vehicle_ml.physics.config import RoleMap, load_roles
 from vehicle_ml.physics.cooling import fit_cooling
@@ -408,37 +410,124 @@ def _false_alarms(
     }
 
 
-def _top_modality(weights: np.ndarray, modalities: Sequence[str], *, total: bool) -> str:
-    """Modality of the largest per-modality sum (``total``) or largest single entry."""
+def _single_modality(weights: np.ndarray, modalities: Sequence[str]) -> str:
+    """Modality of the largest single feature weight."""
     if weights.shape != (len(modalities),):
         raise ValueError("need exactly one modality per feature")
     if not np.isfinite(weights).all():
         return ""
-    if not total:
-        return modalities[int(np.argmax(weights))]
-    names = sorted(set(modalities))
-    sums = [float(np.sum(weights[[m == name for m in modalities]])) for name in names]
-    return names[int(np.argmax(sums))]
+    return modalities[int(np.argmax(weights))]
 
 
-def pca_alarm_modality(residual_sq: np.ndarray, modalities: Sequence[str]) -> str:
-    """Modality holding the largest share of a window's squared reconstruction error.
+def pca_training_means(
+    baseline: BaselineModel,
+    features: pd.DataFrame,
+    modalities: Sequence[str],
+    train_ids: Sequence[str],
+) -> dict[str, float | None]:
+    """Per-modality mean summed squared PCA residual on the healthy training windows.
 
-    ``residual_sq`` is the per-feature squared residual; ``modalities`` gives each
-    feature's modality. Residuals are summed per modality. Ties go to the alphabetically
-    first modality. A window with a non-finite residual has no attribution (``""``).
+    Only rows whose session is in ``train_ids`` are read; the baseline itself was fitted
+    on complete rows from the same sessions, so val/test rows can never change these
+    means. A modality with a non-finite or zero mean is stored as ``None`` and skipped
+    by the ratio attribution.
     """
-    return _top_modality(np.asarray(residual_sq, dtype=float), modalities, total=True)
+    if len(modalities) != len(baseline.feature_names):
+        raise ValueError("need exactly one modality per baseline feature")
+    train = features.loc[features["session_id"].astype(str).isin(set(train_ids))]
+    residuals = baseline.pca_residuals(train)
+    complete = np.isfinite(residuals).all(axis=1)
+    names = sorted(set(modalities))
+    means: dict[str, float | None] = {}
+    for name in names:
+        selected = residuals[complete][:, [modality == name for modality in modalities]]
+        if selected.shape[0] == 0 or selected.shape[1] == 0:
+            means[name] = None
+            continue
+        value = float(np.mean(np.sum(selected, axis=1)))
+        means[name] = value if np.isfinite(value) and value > 0.0 else None
+    return means
+
+
+def pca_alarm_modality(
+    residual_sq: np.ndarray,
+    modalities: Sequence[str],
+    training_mean_sq: Mapping[str, float | None],
+) -> str:
+    """Modality with the largest normalised squared PCA residual.
+
+    ``residual_sq`` is the per-feature squared residual and ``modalities`` gives each
+    feature's modality. A modality's score is its summed residual divided by its mean
+    summed residual on the healthy training windows. Normalising removes the structural
+    advantage of a modality with more features (for example the six IMU axes times
+    statistics and FFT bands). A modality with a zero or non-finite training mean is
+    skipped; if every modality is skipped the window has no attribution (``""``). Ties
+    go to the alphabetically first modality, and a non-finite window is also ``""``.
+    """
+    weights = np.asarray(residual_sq, dtype=float)
+    if weights.shape != (len(modalities),):
+        raise ValueError("need exactly one modality per feature")
+    if not np.isfinite(weights).all():
+        return ""
+    ratios: dict[str, float] = {}
+    for name in sorted(set(modalities)):
+        mean = training_mean_sq.get(name)
+        if mean is None:
+            continue
+        mean = float(mean)
+        if not np.isfinite(mean) or mean <= 0.0:
+            continue
+        total = float(np.sum(weights[[modality == name for modality in modalities]]))
+        ratios[name] = total / mean
+    if not ratios:
+        return ""
+    return min(ratios, key=lambda name: (-ratios[name], name))
 
 
 def z_alarm_modality(abs_z: np.ndarray, modalities: Sequence[str]) -> str:
-    """Modality of the feature with the largest |z| (``""`` for a non-finite window)."""
-    return _top_modality(np.abs(np.asarray(abs_z, dtype=float)), modalities, total=False)
+    """Modality of the feature with the largest |z| (``""`` for a non-finite window).
+
+    This stays unnormalised: |z| is already scale-free per feature, so the modality with
+    the largest single deviation is the intended attribution.
+    """
+    return _single_modality(np.abs(np.asarray(abs_z, dtype=float)), modalities)
 
 
 def _modalities_of(feature_names: Sequence[str]) -> list[str]:
     metadata = feature_metadata(feature_names, allow_unknown=True)
     return [metadata[name].modality for name in feature_names]
+
+
+def _baseline_feature_names(features: pd.DataFrame) -> list[str]:
+    """Numeric feature columns that have at least one finite value in the fit rows."""
+    skipped = {"session_id", "start_ms", "end_ms", "split"}
+    return [
+        str(column)
+        for column in features.select_dtypes(include=[np.number]).columns
+        if str(column) not in skipped and features[column].notna().any()
+    ]
+
+
+def _fit_baseline(
+    features: pd.DataFrame,
+    split_manifest: Mapping[str, Sequence[str]],
+    train_ids: Sequence[str],
+) -> BaselineModel:
+    """Fit the scaler and both baselines on complete train windows only.
+
+    A window missing any baseline feature is excluded from the fit; it later receives
+    no baseline score and is reported as unscored (ML-24).
+    """
+    train = features.loc[features["session_id"].astype(str).isin(set(train_ids))]
+    names = _baseline_feature_names(train)
+    if not names:
+        raise ValueError("no numeric baseline features in the train windows")
+    complete = np.isfinite(train[names].to_numpy(dtype=float)).all(axis=1)
+    if not complete.any():
+        raise ValueError("baseline needs at least one complete train window")
+    complete_features = train.loc[complete, ["session_id", *names]].copy()
+    scaler = Standardizer.fit(complete_features, split_manifest)
+    return BaselineModel.fit(complete_features, split_manifest, scaler)
 
 
 def _physics_attribution(scores: pd.DataFrame, group_of: Mapping[str, str]) -> pd.DataFrame:
@@ -559,6 +648,18 @@ def _markdown(data: dict) -> str:
         lines.append(f"| {model} | {data['thresholds'][model]:.6g} |")
     lines += [
         "",
+        "## PCA attribution reference",
+        "",
+        "The PCA modality ratio divides a window's summed squared residual by these "
+        "healthy-training means, so a modality with more features is not favoured.",
+        "",
+        "| modality | mean summed squared residual |",
+        "|---|---|",
+    ]
+    for name, mean in data.get("pca_modality_training_mean_sq", {}).items():
+        lines.append(f"| {name} | {'skipped' if mean is None else f'{mean:.6g}'} |")
+    lines += [
+        "",
         "## False alarms on test healthy sessions",
         "",
         "| model | episodes | hours | per hour |",
@@ -653,12 +754,14 @@ def evaluate(
     train_healthy = _healthy(result.split["train"], faults)
     physics_scores = _physics_scores(physics, result.features["session_id"].isin(train_healthy))
 
-    train_features = result.features.loc[result.features["session_id"].isin(train_healthy)]
-    baseline = BaselineModel.fit(train_features, result.split, result.scaler)
+    baseline = _fit_baseline(result.features, result.split, train_healthy)
     baseline_scores = baseline.scores(result.features)
     feature_modalities = _modalities_of(baseline.feature_names)
+    pca_training_mean_sq = pca_training_means(
+        baseline, result.features, feature_modalities, train_healthy
+    )
     pca_modality = [
-        pca_alarm_modality(row, feature_modalities)
+        pca_alarm_modality(row, feature_modalities, pca_training_mean_sq)
         for row in baseline.pca_residuals(result.features)
     ]
     z_modality = [
@@ -724,6 +827,7 @@ def evaluate(
         "fit_sessions": result.split["train"],
         "threshold_sessions": val_healthy,
         "thresholds": thresholds,
+        "pca_modality_training_mean_sq": pca_training_mean_sq,
         "models": models,
         "faults_present": bool(faults),
         "missing_roles": missing_roles,

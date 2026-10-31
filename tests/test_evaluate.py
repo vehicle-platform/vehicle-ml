@@ -6,9 +6,11 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from tests.physics_synthetic import IMU_PERIOD_MS, PhysicsDataset, make_physics_data_dir
+from vehicle_ml.baseline import BaselineModel
 from vehicle_ml.cli import main
 from vehicle_ml.data.sources import imu_columns
 from vehicle_ml.evaluate import (
@@ -20,8 +22,10 @@ from vehicle_ml.evaluate import (
     evaluate,
     evaluate_seeds,
     pca_alarm_modality,
+    pca_training_means,
     z_alarm_modality,
 )
+from vehicle_ml.normalize import Standardizer
 from vehicle_ml.physics.config import PHYSICS_GROUPS
 
 CONFIG = Path(__file__).resolve().parents[1] / "configs" / "physics_cl250.toml"
@@ -57,6 +61,10 @@ def test_evaluate_writes_reports_and_per_fault_metrics(tmp_path: Path) -> None:
     assert SYNTHETIC_NOTE in result.markdown_path.read_text(encoding="utf-8")
     assert set(data["thresholds"]) == set(MODEL_NAMES)
     assert set(data["models"]) == set(MODEL_NAMES)
+    assert set(data["pca_modality_training_mean_sq"]) == {"can", "imu"}
+    assert all(
+        mean is None or mean > 0.0 for mean in data["pca_modality_training_mean_sq"].values()
+    )
 
     expected = _expected_fault_kinds(dataset, data["split"])
     for model in MODEL_NAMES:
@@ -141,13 +149,66 @@ def test_cli_bad_arguments_exit_non_zero(tmp_path: Path) -> None:
 
 def test_alarm_modality_of_a_hand_built_pca_residual() -> None:
     modalities = ["can", "can", "imu", "can", "imu"]
-    # The IMU features hold the largest share (5.1 against 0.6 on CAN).
-    assert pca_alarm_modality(np.array([0.1, 0.2, 5.0, 0.3, 0.1]), modalities) == "imu"
+    means = {"can": 1.0, "imu": 1.0}
+    # The IMU features hold the largest normalised share (5.1 against 0.6 on CAN).
+    assert pca_alarm_modality(np.array([0.1, 0.2, 5.0, 0.3, 0.1]), modalities, means) == "imu"
     # Per-modality sums, not the single largest entry: three CAN features of 2.0 beat one 5.0.
-    assert pca_alarm_modality(np.array([2.0, 2.0, 5.0, 2.0, 0.0]), modalities) == "can"
-    assert pca_alarm_modality(np.array([0.1, np.nan, 5.0, 0.3, 0.1]), modalities) == ""
+    assert pca_alarm_modality(np.array([2.0, 2.0, 5.0, 2.0, 0.0]), modalities, means) == "can"
+    assert pca_alarm_modality(np.array([0.1, np.nan, 5.0, 0.3, 0.1]), modalities, means) == ""
     with pytest.raises(ValueError, match="one modality per feature"):
-        pca_alarm_modality(np.array([1.0, 2.0]), modalities)
+        pca_alarm_modality(np.array([1.0, 2.0]), modalities, means)
+
+
+def test_pca_ratio_removes_the_feature_count_advantage() -> None:
+    # Ten IMU features with small residuals sum to 30; two CAN features sum to 20.
+    # The raw sum would choose IMU, but the training means make CAN the larger ratio.
+    modalities = ["can", "can"] + ["imu"] * 10
+    residuals = np.array([20.0, 0.0] + [3.0] * 10)
+    means = {"can": 1.0, "imu": 100.0}
+    assert pca_alarm_modality(residuals, modalities, means) == "can"
+
+
+def test_pca_attribution_skips_zero_and_non_finite_training_means() -> None:
+    modalities = ["can", "can", "imu"]
+    residuals = np.array([1.0, 1.0, 10.0])
+    assert pca_alarm_modality(residuals, modalities, {"can": 0.0, "imu": np.nan}) == ""
+    assert pca_alarm_modality(residuals, modalities, {"can": 2.0, "imu": 0.0}) == "can"
+
+
+def test_pca_training_means_read_only_the_training_sessions() -> None:
+    train = pd.DataFrame(
+        {
+            "session_id": ["train"] * 4,
+            "start_ms": [0, 1000, 2000, 3000],
+            "end_ms": [1000, 2000, 3000, 4000],
+            "a": [0.0, 1.0, 2.0, 3.0],
+            "b": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+    features = pd.concat(
+        [
+            train,
+            pd.DataFrame(
+                {
+                    "session_id": ["val", "test"],
+                    "start_ms": [0, 0],
+                    "end_ms": [1000, 1000],
+                    "a": [1000.0, 2000.0],
+                    "b": [1000.0, 2000.0],
+                }
+            ),
+        ],
+        ignore_index=True,
+    )
+    scaler = Standardizer.fit(train, {"train": ["train"]})
+    baseline = BaselineModel.fit(train, {"train": ["train"]}, scaler)
+    modalities = ["can", "can"]
+
+    means = pca_training_means(baseline, features, modalities, ["train"])
+    poisoned = features.copy()
+    poisoned.loc[poisoned["session_id"] != "train", ["a", "b"]] = 1e9
+    assert pca_training_means(baseline, poisoned, modalities, ["train"]) == means
+    assert means["can"] is not None and means["can"] > 0.0
 
 
 def test_alarm_modality_of_a_hand_built_z_vector() -> None:
