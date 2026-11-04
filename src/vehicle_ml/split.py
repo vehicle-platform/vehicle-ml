@@ -7,11 +7,13 @@ hash of ``(seed, session_id)`` so adding a session never moves an existing one.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Sequence
+import math
+from collections.abc import Collection, Iterable, Mapping, Sequence
 
 import pandas as pd
 
 PARTS = ("train", "val", "test")
+SPLIT_PARTS = (*PARTS, "test_holdout")
 
 
 def _validate_fractions(fractions: Sequence[float]) -> tuple[float, float, float]:
@@ -53,6 +55,84 @@ def split_sessions(
     result: dict[str, list[str]] = {part: [] for part in PARTS}
     for session_id in ids:
         result[assign_split(session_id, fractions, seed)].append(session_id)
+    return result
+
+
+def _operating_value(point: object, axis: str) -> float | None:
+    """Read one axis from an ``OperatingPoint``, an axis mapping or a scalar."""
+    values = getattr(point, "values", None)
+    if values is None and isinstance(point, Mapping):
+        values = point.get("values", point)
+    if values is not None:
+        if not hasattr(values, "get"):
+            raise TypeError("operating point values must be a mapping")
+        value = values.get(axis)
+    else:
+        value = point
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"operating point on axis {axis!r} is not numeric") from None
+    return number if math.isfinite(number) else None
+
+
+def split_by_band(
+    points: Mapping[str, object],
+    axis: str,
+    band: tuple[float, float],
+    *,
+    seed: int = 0,
+    fractions: tuple[float, float, float] = (0.7, 0.15, 0.15),
+    healthy: Collection[str] | None = None,
+) -> dict[str, list[str]]:
+    """Hold out a closed operating-point band and split the rest by session.
+
+    Every session whose ``axis`` value lies in ``[low, high]`` goes to
+    ``test_holdout``. Sessions with no finite value on the axis are excluded and listed
+    under ``excluded``; they are never assigned to train, val, test or the holdout. The
+    remaining sessions use :func:`split_sessions` with the same seed.
+
+    When ``healthy`` is given, train and val must each contain at least one healthy
+    session; otherwise they must at least be non-empty. A band without any session or a
+    band that empties train/val raises ``ValueError``.
+    """
+    if not axis:
+        raise ValueError("axis must be a non-empty operating-point axis")
+    low, high = (float(band[0]), float(band[1]))
+    if not math.isfinite(low) or not math.isfinite(high):
+        raise ValueError("band edges must be finite")
+    if low > high:
+        raise ValueError("band low edge must not exceed its high edge")
+    _validate_fractions(fractions)
+
+    held: list[str] = []
+    remaining: list[str] = []
+    excluded: list[str] = []
+    for session_id, point in points.items():
+        value = _operating_value(point, axis)
+        if value is None:
+            excluded.append(str(session_id))
+        elif low <= value <= high:
+            held.append(str(session_id))
+        else:
+            remaining.append(str(session_id))
+
+    if not held:
+        raise ValueError(f"holdout band [{low:g}, {high:g}] on {axis!r} has no session")
+    result = split_sessions(remaining, fractions, seed)
+    result["test_holdout"] = sorted(held)
+    result["excluded"] = excluded
+
+    healthy_ids = set(healthy) if healthy is not None else None
+    for part in ("train", "val"):
+        if not result[part]:
+            raise ValueError(f"holdout band leaves {part} without a session")
+        if healthy_ids is not None and not healthy_ids.intersection(result[part]):
+            raise ValueError(f"holdout band leaves {part} without a healthy session")
+
+    assert_no_leakage(*(result[part] for part in SPLIT_PARTS))
     return result
 
 

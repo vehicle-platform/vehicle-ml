@@ -1,0 +1,304 @@
+{
+  "baseline_excluded_features": [],
+  "baseline_excluded_modalities": [],
+  "baseline_unscored": {
+    "test": [],
+    "train": [],
+    "val": []
+  },
+  "defs_version": "v0.20.0",
+  "faults_present": true,
+  "fit_sessions": [
+    "phys-00",
+    "phys-02",
+    "phys-03",
+    "phys-04",
+    "phys-09",
+    "phys-11",
+    "phys-12",
+    "phys-15",
+    "phys-16",
+    "phys-17",
+    "phys-18",
+    "phys-19",
+    "phys-20",
+    "phys-21",
+    "phys-22",
+    "phys-24",
+    "phys-25",
+    "phys-26"
+  ],
+  "max_gap_ms": 500,
+  "missing_roles": {},
+  "models": {
+    "baseline_pca": {
+      "test": {
+        "false_alarms": {
+          "episodes": 3.0,
+          "hours": 0.03333333333333333,
+          "per_hour": 90.0
+        },
+        "faults": {
+          "clutch_slip": {
+            "detected": 0,
+            "expected_modality": "can",
+            "first_alarm_matches_expected": 0,
+            "first_alarm_modalities": {},
+            "groups": {},
+            "median_delay_ms": null,
+            "missed": 1,
+            "modalities": {},
+            "not_evaluated": 0,
+            "sessions": 1
+          },
+          "fan_failure": {
+            "detected": 0,
+            "expected_modality": "can",
+            "first_alarm_matches_expected": 0,
+            "first_alarm_modalities": {},
+            "groups": {},
+            "median_delay_ms": null,
+            "missed": 1,
+            "modalities": {},
+            "not_evaluated": 0,
+            "sessions": 1
+          },
+          "plateau_sag": {
+            "detected": 1,
+            "expected_modality": "can",
+            "first_alarm_matches_expected": 1,
+            "first_alarm_modalities": {
+              "can": 1
+            },
+            "groups": {},
+            "median_delay_ms": 0.0,
+            "missed": 0,
+            "modalities": {
+              "can": 5
+            },
+            "not_evaluated": 0,
+            "sessions": 1
+          },
+          "wheel_vibration": {
+            "detected": 1,
+            "expected_modality": "imu",
+            "first_alarm_matches_expected": 1,
+            "first_alarm_modalities": {
+              "imu": 1
+            },
+            "groups": {},
+            "median_delay_ms": 0.0,
+            "missed": 0,
+            "modalities": {
+              "imu": 5
+            },
+            "not_evaluated": 0,
+            "sessions": 1
+          }
+        }
+      },
+      "threshold": 0.3763723525185851
+    },
+    "baseline_z": {
+      "test": {
+        "false_alarms": {
+          "episodes": 3.0,
+          "hours": 0.03333333333333333,
+          "per_hour": 90.0
+        },
+        "faults": {
+          "clutch_slip": {
+            "detected": 0,
+            "expected_modality": "can",
+            "first_alarm_matches_expected": 0,
+            "first_alarm_modalities": {},
+            "groups": {},
+            "median_delay_ms": null,
+            "missed": 1,
+            "modalities": {},
+            "not_evaluated": 0,
+            "sessions": 1
+          },
+          "fan_failure": {
+            "detected": 1,
+            "expected_modality": "can",
+            "first_alarm_matches_expected": 1,
+            "first_alarm_modalities": {
+              "can": 1
+            },
+            "groups": {},
+            "median_delay_ms": 10000.0,
+            "missed": 0,
+            "modalities": {
+              "can": 2
+            },
+            "not_evaluated": 0,
+            "sessions": 1
+          },
+          "plateau_sag": {
+            "detected": 1,
+            "expected_modality": "can",
+            "first_alarm_matches_expected": 1,
+            "first_alarm_modalities": {
+              "can": 1
+            },
+            "groups": {},
+            "median_delay_ms": 0.0,
+            "missed": 0,
+            "modalities": {
+              "can": 5
+            },
+            "not_evaluated": 0,
+            "sessions": 1
+          },
+          "wheel_vibration": {
+            "detected": 1,
+            "expected_modality": "imu",
+            "first_alarm_matches_expected": 1,
+            "first_alarm_modalities": {
+              "imu": 1
+            },
+            "groups": {},
+            "median_delay_ms": 0.0,
+            "missed": 0,
+            "modalities": {
+              "imu": 5
+            },
+            "not_evaluated": 0,
+            "sessions": 1
+          }
+        }
+      },
+      "threshold": 4.784156988664602
+    },
+    "physics": {
+      "test": {
+        "false_alarms": {
+          "episodes": 0.0,
+          "hours": 0.03333333333333333,
+          "per_hour": 0.0
+        },
+        "faults": {
+          "clutch_slip": {
+            "detected": 1,
+            "expected_modality": "can",
+            "first_alarm_matches_expected": 1,
+            "first_alarm_modalities": {
+              "can": 1
+            },
+            "groups": {
+              "longitudinal": 1
+            },
+            "median_delay_ms": 0.0,
+            "missed": 0,
+            "modalities": {
+              "can": 5
+            },
+            "not_evaluated": 0,
+            "sessions": 1
+          },
+          "fan_failure": {
+            "detected": 0,
+            "expected_modality": "can",
+            "first_alarm_matches_expected": 0,
+            "first_alarm_modalities": {},
+            "groups": {},
+            "median_delay_ms": null,
+            "missed": 1,
+            "modalities": {},
+            "not_evaluated": 0,
+            "sessions": 1
+          },
+          "plateau_sag": {
+            "detected": 1,
+            "expected_modality": "can",
+            "first_alarm_matches_expected": 1,
+            "first_alarm_modalities": {
+              "can": 1
+            },
+            "groups": {
+              "charging": 1
+            },
+            "median_delay_ms": 15000.0,
+            "missed": 0,
+            "modalities": {
+              "can": 2
+            },
+            "not_evaluated": 0,
+            "sessions": 1
+          },
+          "wheel_vibration": {
+            "detected": 0,
+            "expected_modality": "imu",
+            "first_alarm_matches_expected": 0,
+            "first_alarm_modalities": {},
+            "groups": {},
+            "median_delay_ms": null,
+            "missed": 1,
+            "modalities": {},
+            "not_evaluated": 0,
+            "sessions": 1
+          }
+        }
+      },
+      "threshold": 75.99032330757854
+    }
+  },
+  "not_calibrated": [],
+  "note": "synthetic data; no generalisation claim (rule 4)",
+  "pca_modality_training_mean_sq": {
+    "can": 1.5012320265743953,
+    "imu": 5.023094179842467
+  },
+  "seed": 0,
+  "split": {
+    "test": [
+      "phys-01",
+      "phys-06",
+      "phys-07",
+      "phys-10",
+      "phys-14",
+      "phys-27"
+    ],
+    "train": [
+      "phys-00",
+      "phys-02",
+      "phys-03",
+      "phys-04",
+      "phys-09",
+      "phys-11",
+      "phys-12",
+      "phys-15",
+      "phys-16",
+      "phys-17",
+      "phys-18",
+      "phys-19",
+      "phys-20",
+      "phys-21",
+      "phys-22",
+      "phys-24",
+      "phys-25",
+      "phys-26"
+    ],
+    "val": [
+      "phys-05",
+      "phys-08",
+      "phys-13",
+      "phys-23"
+    ]
+  },
+  "stride_ms": 5000,
+  "target_false_alarms_per_hour": 1.0,
+  "threshold_sessions": [
+    "phys-05",
+    "phys-08",
+    "phys-13",
+    "phys-23"
+  ],
+  "thresholds": {
+    "baseline_pca": 0.3763723525185851,
+    "baseline_z": 4.784156988664602,
+    "physics": 75.99032330757854
+  },
+  "window_ms": 10000
+}

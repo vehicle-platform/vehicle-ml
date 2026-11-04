@@ -5,11 +5,14 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from vehicle_ml.operating_point import OperatingPoint
 from vehicle_ml.split import (
     PARTS,
+    SPLIT_PARTS,
     assert_no_leakage,
     assign_split,
     group_kfold,
+    split_by_band,
     split_sessions,
 )
 
@@ -79,3 +82,86 @@ def test_leakage_is_detected_across_frames_and_lists() -> None:
 
 def test_clean_parts_pass() -> None:
     assert_no_leakage(["a", "b"], ["c"], pd.DataFrame({"session_id": ["d"]}))
+
+
+def _points(count: int) -> dict[str, OperatingPoint]:
+    return {
+        f"session-{index:02d}": OperatingPoint(
+            session_id=f"session-{index:02d}",
+            values={"temperature": float(index)},
+            samples={"temperature": 1},
+        )
+        for index in range(count)
+    }
+
+
+def test_split_by_band_is_deterministic_and_holds_out_the_closed_band() -> None:
+    points = _points(30)
+    first = split_by_band(points, "temperature", (10.0, 19.0), seed=4)
+    second = split_by_band(points, "temperature", (10.0, 19.0), seed=4)
+
+    assert first == second
+    assert first["test_holdout"] == [f"session-{index:02d}" for index in range(10, 20)]
+    assert first["excluded"] == []
+    assert sum(len(first[part]) for part in SPLIT_PARTS) == 30
+    assert_no_leakage(*(first[part] for part in SPLIT_PARTS))
+    for part in ("train", "val", "test"):
+        values = [points[session_id].value("temperature") for session_id in first[part]]
+        assert all(value is not None and not 10.0 <= value <= 19.0 for value in values)
+
+
+def test_split_by_band_edges_are_inclusive_and_none_is_excluded() -> None:
+    points = _points(12)
+    points["session-none"] = OperatingPoint(
+        session_id="session-none", values={"temperature": None}, samples={"temperature": 0}
+    )
+    split = split_by_band(points, "temperature", (3.0, 5.0), seed=0)
+
+    assert set(split["test_holdout"]) == {"session-03", "session-04", "session-05"}
+    assert split["excluded"] == ["session-none"]
+    assert "session-none" not in {sid for part in SPLIT_PARTS for sid in split[part]}
+    assert_no_leakage(*(split[part] for part in SPLIT_PARTS))
+
+
+def test_split_by_band_seed_changes_only_the_remaining_split() -> None:
+    points = _points(40)
+    first = split_by_band(points, "temperature", (10.0, 19.0), seed=0)
+    second = split_by_band(points, "temperature", (10.0, 19.0), seed=1)
+
+    assert first["test_holdout"] == second["test_holdout"]
+    assert first["train"] != second["train"]
+
+
+def test_split_by_band_refuses_an_empty_holdout_or_an_empty_part() -> None:
+    points = _points(10)
+    with pytest.raises(ValueError, match="has no session"):
+        split_by_band(points, "temperature", (100.0, 200.0), seed=0)
+    with pytest.raises(ValueError, match="train without a session"):
+        split_by_band(points, "temperature", (0.0, 20.0), seed=0)
+    with pytest.raises(ValueError, match="low edge"):
+        split_by_band(points, "temperature", (5.0, 1.0), seed=0)
+
+
+def test_split_by_band_refuses_train_or_val_without_a_healthy_session() -> None:
+    points = _points(40)
+    held = {"session-00"}
+    remaining = [session_id for session_id in points if session_id not in held]
+    base = split_sessions(remaining, seed=3)
+    assert base["train"] and base["val"]
+
+    with pytest.raises(ValueError, match="val without a healthy session"):
+        split_by_band(
+            points,
+            "temperature",
+            (0.0, 0.0),
+            seed=3,
+            healthy=set(base["train"]),
+        )
+    with pytest.raises(ValueError, match="train without a healthy session"):
+        split_by_band(
+            points,
+            "temperature",
+            (0.0, 0.0),
+            seed=3,
+            healthy=set(base["val"]),
+        )
