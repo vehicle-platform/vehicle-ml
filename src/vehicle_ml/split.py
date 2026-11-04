@@ -122,7 +122,7 @@ def split_by_band(
     if not held:
         raise ValueError(f"holdout band [{low:g}, {high:g}] on {axis!r} has no session")
     result = split_sessions(remaining, fractions, seed)
-    result["test_holdout"] = held
+    result["test_holdout"] = sorted(held)
     result["excluded"] = excluded
 
     healthy_ids = set(healthy) if healthy is not None else None
