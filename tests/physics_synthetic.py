@@ -209,7 +209,15 @@ DEFAULT_PHYSICS_SESSIONS: tuple[PhysicsSessionSpec, ...] = (
 # outside it. Faults are assigned so every split (train, val, test and test_holdout) has
 # a healthy session and one session of every CAN fault kind. The ids are chosen so the
 # seed-0 stable hash gives the intended val/test groups; the proxy values still come from
-# the generated recordings, never from this table.
+# the generated recordings, never from this table. The hand-picked ids are fragile: a
+# change to the split hash or to the id list can move a session to another part, and the
+# stage-2 tests then fail on their per-part coverage checks.
+#
+# The generator raises the coolant temperature with load, so the coolant proxy mixes
+# ambient temperature and load. The cold sessions need a low load to stay inside the
+# band; the healthy ``warm-low-*`` sessions give train/val/test the same low engine
+# speeds, so the holdout differs from the rest in temperature only and not in load
+# (without them, the physics charging model extrapolated below the training RPM range).
 GENERALISATION_PHYSICS_SESSIONS: tuple[PhysicsSessionSpec, ...] = (
     PhysicsSessionSpec(
         "cold-00",
@@ -315,6 +323,14 @@ GENERALISATION_PHYSICS_SESSIONS: tuple[PhysicsSessionSpec, ...] = (
         "warm-023", seed=228, ambient_c=30.0, load=0.9, fault="clutch_slip", onset_ms=30000
     ),
     PhysicsSessionSpec("warm-030", seed=229, ambient_c=30.0, load=1.2),
+    PhysicsSessionSpec("warm-low-0", seed=300, ambient_c=25.0, load=0.3),
+    PhysicsSessionSpec("warm-low-1", seed=301, ambient_c=20.0, load=0.35),
+    PhysicsSessionSpec("warm-low-2", seed=302, ambient_c=25.0, load=0.4),
+    PhysicsSessionSpec("warm-low-3", seed=303, ambient_c=30.0, load=0.3),
+    PhysicsSessionSpec("warm-low-4", seed=304, ambient_c=35.0, load=0.35),
+    PhysicsSessionSpec("warm-low-5", seed=305, ambient_c=40.0, load=0.4),
+    PhysicsSessionSpec("warm-low-6", seed=306, ambient_c=20.0, load=0.3),
+    PhysicsSessionSpec("warm-low-7", seed=307, ambient_c=30.0, load=0.35),
 )
 
 

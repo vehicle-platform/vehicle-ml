@@ -15,6 +15,7 @@ from tests.physics_synthetic import (
     make_physics_data_dir,
 )
 from vehicle_ml.cli import main
+from vehicle_ml.data.store import SessionStore
 from vehicle_ml.evaluate import (
     HYBRID_MODEL,
     SYNTHETIC_NOTE,
@@ -23,7 +24,9 @@ from vehicle_ml.evaluate import (
     evaluate_seeds,
 )
 from vehicle_ml.hybrid import HYBRID_WEIGHTS
-from vehicle_ml.split import SPLIT_PARTS, assert_no_leakage
+from vehicle_ml.operating_point import session_operating_points
+from vehicle_ml.physics.config import load_roles
+from vehicle_ml.split import SPLIT_PARTS, assert_no_leakage, split_by_band
 
 CONFIG = Path(__file__).resolve().parents[1] / "configs" / "physics_cl250.toml"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "evaluation_stage1_default.json"
@@ -272,3 +275,17 @@ def test_unknown_holdout_axis_is_refused(tmp_path: Path) -> None:
             holdout_axis="humidity",
             holdout_band=(0.0, 1.0),
         )
+
+
+def test_the_cold_holdout_differs_in_temperature_not_in_load(tmp_path: Path) -> None:
+    # The coolant proxy rises with load, so a temperature band also selects low loads.
+    # The holdout is only a temperature test if its load proxy lies inside the range the
+    # fitted sessions cover; otherwise the physics charging model is scored off its RPM range.
+    root, dataset = _stage2_dataset(tmp_path)
+    ids = [session.spec.session_id for session in dataset.sessions]
+    points = session_operating_points(SessionStore(root), ids, load_roles(CONFIG))
+    split = split_by_band(points, "temperature", (30.0, 45.0), seed=0)
+    fitted = [points[session_id].values["load"] for session_id in split["train"]]
+    held = [points[session_id].values["load"] for session_id in split["test_holdout"]]
+    assert min(fitted) <= min(held)
+    assert max(held) <= max(fitted)

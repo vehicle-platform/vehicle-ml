@@ -1632,7 +1632,10 @@ def evaluate_seeds(
     out_path = Path(out_dir)
     per_seed: dict[int, dict] = {}
     for seed in seeds:
-        result = evaluate(data_dir, out_path / f"seed-{seed}", config_path, seed=seed, **kwargs)
+        try:
+            result = evaluate(data_dir, out_path / f"seed-{seed}", config_path, seed=seed, **kwargs)
+        except ValueError as error:
+            raise ValueError(f"seed {seed}: {error}") from error
         per_seed[seed] = result.data
 
     data: dict[str, object] = {

@@ -246,6 +246,27 @@ Add `--seeds 0,1,2` to repeat the evaluation with the same holdout and aggregate
 per-seed metrics. Stage 2 on real rides and HIL fault injection is still to come; it needs
 ride data and the HIL bench, and it does not change any safety threshold.
 
+### Limitations of the synthetic stage 2
+
+- **The temperature proxy is not ambient temperature.** Median coolant temperature rises
+  with load, so a coolant band also selects a load range. The synthetic scenario adds
+  low-load warm sessions to train/val/test so the cold holdout differs in temperature only;
+  without them the physics charging model was scored below its training RPM range and
+  every cold "detection" came from the charging group. A real-ride holdout needs the same
+  check: compare the load proxy of the holdout with the training range before reading the
+  report.
+- **Cooling faults move the proxy.** `fan_failure` and `thermostat_stuck_open` change the
+  coolant temperature, so a faulty session can enter or leave a temperature band because of
+  its fault.
+- **Holdout detections are only meaningful next to the holdout false-alarm rate.** When a
+  model alarms often on healthy holdout sessions, an alarm after the onset of a fault
+  session counts as a detection even if it has nothing to do with the fault. Read
+  `detected` together with `false_alarms.per_hour` of the same part.
+- On the synthetic cold holdout the physics model does not generalise better than the
+  baseline: its cooling group alarms on healthy cold sessions, whose coolant temperatures
+  the warm-only fit has never seen. This is reported, not tuned away; no generalisation
+  claim follows from it (methodology rule 4).
+
 ## Build
 
 ```sh
