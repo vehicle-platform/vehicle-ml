@@ -91,6 +91,16 @@ is read from an optional `faults.json` next to the data directory (the ML-11 syn
 helper writes it, with an `expected_modality` per session); without that file the report
 contains false alarms only.
 
+### Operating-point proxies (stage 2)
+
+The role map has no ambient-temperature signal and the vehicle has no direct load signal
+in the roles. The stage-2 holdout split therefore uses two **proxies** taken from the
+recorded session itself: median coolant temperature for ambient temperature, and median
+engine speed for load. `[operating_point]` in `configs/physics_cl250.toml` maps the axes
+to those existing roles; `session_operating_points` reports the median and valid sample
+count per session, and leaves an axis `None` when the session has no valid sample. It
+never reads `faults.json` or the synthetic spec.
+
 ### Attribution (rule 3)
 
 Every feature column has a source (`did.<NAME>`, `derived.<name>`, `sensor.<name>`) and a

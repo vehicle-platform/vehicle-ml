@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from vehicle_ml.data.naming import physical_column
@@ -27,6 +27,7 @@ REQUIRED_ROLES = (
 )
 PHYSICS_ESTIMATORS = ("cooling", "charging", "gearing")
 PHYSICS_GROUPS = ("cooling", "charging", "longitudinal")
+OPERATING_POINT_AXES = ("temperature", "load")
 
 
 def _validate_signal(role: str, spec: str) -> tuple[str, str]:
@@ -51,6 +52,7 @@ class RoleMap:
     roles: Mapping[str, str]
     groups: Mapping[str, str]
     source: Path | None = None
+    operating_point: Mapping[str, str] = field(default_factory=dict)
 
     def signal(self, role: str) -> str:
         try:
@@ -121,10 +123,33 @@ def load_roles(path: str | Path, required: tuple[str, ...] = REQUIRED_ROLES) -> 
     if missing_groups:
         raise ValueError(f"{config_path}: missing estimator groups: {', '.join(missing_groups)}")
 
-    return RoleMap(roles=roles, groups=groups, source=config_path)
+    raw_operating_point = data.get("operating_point")
+    operating_point: dict[str, str] = {}
+    if raw_operating_point is not None:
+        if not isinstance(raw_operating_point, dict):
+            raise ValueError(f"{config_path}: expected an [operating_point] table")
+        for axis, role in raw_operating_point.items():
+            if not isinstance(axis, str) or axis not in OPERATING_POINT_AXES:
+                raise ValueError(
+                    f"{config_path}: unknown operating-point axis {axis!r}; "
+                    f"expected one of {', '.join(OPERATING_POINT_AXES)}"
+                )
+            if not isinstance(role, str) or role not in roles:
+                raise ValueError(
+                    f"{config_path}: operating-point axis {axis!r} maps to unknown role {role!r}"
+                )
+            operating_point[axis] = role
+
+    return RoleMap(
+        roles=roles,
+        groups=groups,
+        source=config_path,
+        operating_point=operating_point,
+    )
 
 
 __all__ = [
+    "OPERATING_POINT_AXES",
     "PHYSICS_ESTIMATORS",
     "PHYSICS_GROUPS",
     "REQUIRED_ROLES",
