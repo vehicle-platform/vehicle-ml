@@ -34,13 +34,20 @@ from vehicle_ml.data.store import SessionStore
 from vehicle_ml.dataset import build_dataset
 from vehicle_ml.defs import defs_version, vehicle_derived
 from vehicle_ml.features import IDENTITY_COLUMNS
+from vehicle_ml.hybrid import (
+    DEFAULT_HYBRID_WEIGHT,
+    HYBRID_MODEL,
+    HYBRID_WEIGHTS,
+    HybridScorer,
+)
 from vehicle_ml.normalize import Standardizer
+from vehicle_ml.operating_point import OperatingPoint, load_role_frame, session_operating_points
 from vehicle_ml.physics.charging import fit_charging
 from vehicle_ml.physics.config import RoleMap, load_roles
 from vehicle_ml.physics.cooling import fit_cooling
 from vehicle_ml.physics.errors import NotIdentifiableError
 from vehicle_ml.physics.gearing import GearTable
-from vehicle_ml.windows import align_frames
+from vehicle_ml.split import SPLIT_PARTS, split_by_band
 
 COOLING_FEATURES = (
     "cooling_a",
@@ -135,52 +142,6 @@ def _load_faults(data_dir: Path) -> dict[str, dict[str, object]]:
             "expected_modality": expected,
         }
     return result
-
-
-def _load_role_frame(
-    store: SessionStore,
-    session_id: str,
-    roles: RoleMap,
-    max_gap_ms: float,
-) -> tuple[pd.DataFrame | None, list[str]]:
-    telemetry = store.load(session_id, "telemetry")
-    if telemetry is None:
-        return None, list(roles.roles)
-
-    frame = telemetry[["session_id", "device_time_ms"]].copy()
-    missing: list[str] = []
-    for role in roles.roles:
-        if roles.kind(role) != "did":
-            continue
-        column = roles.column(role)
-        if column in telemetry.columns:
-            frame[role] = telemetry[column].to_numpy()
-        else:
-            missing.append(role)
-            frame[role] = np.nan
-
-    derived = store.load(session_id, "derived")
-    derived_roles = [role for role in roles.roles if roles.kind(role) == "derived"]
-    if derived is None or derived.empty:
-        missing.extend(derived_roles)
-        for role in derived_roles:
-            frame[role] = np.nan
-        return frame, missing
-
-    wide = derived.pivot_table(
-        index="device_time_ms", columns="signal", values="value", aggfunc="last"
-    ).reset_index()
-    wide["session_id"] = session_id
-    available = [role for role in derived_roles if roles.column(role) in wide.columns]
-    unavailable = [role for role in derived_roles if role not in available]
-    missing.extend(unavailable)
-    for role in unavailable:
-        frame[role] = np.nan
-    if available:
-        aligned = align_frames(frame, wide, available, tolerance_ms=max_gap_ms)
-        for role in available:
-            frame[role] = aligned[role].to_numpy()
-    return frame, missing
 
 
 def _healthy(ids: Sequence[str], faults: Mapping[str, dict[str, object]]) -> list[str]:
@@ -654,6 +615,8 @@ def _fault_results(
                 "first_alarm_modalities": Counter(),
                 "first_alarm_matches_expected": 0,
                 "groups": Counter(),
+                "dominant_terms": Counter(),
+                "first_alarm_dominant": Counter(),
             },
         )
         entry["sessions"] = int(entry["sessions"]) + 1
@@ -675,11 +638,16 @@ def _fault_results(
             entry["first_alarm_matches_expected"] = int(entry["first_alarm_matches_expected"]) + 1
         if model == "physics":
             entry["groups"][str(first["physics_group"])] += 1
+        elif model == HYBRID_MODEL:
+            if first["hybrid_dominant"] == "physics":
+                entry["groups"][str(first["hybrid_group"])] += 1
+            entry["dominant_terms"].update(str(value) for value in alarm["hybrid_dominant"])
+            entry["first_alarm_dominant"][str(first["hybrid_dominant"])] += 1
 
     result: dict[str, dict[str, object]] = {}
     for kind, entry in sorted(grouped.items()):
         delays = [int(value) for value in entry["delays_ms"]]
-        result[kind] = {
+        item: dict[str, object] = {
             "sessions": int(entry["sessions"]),
             "detected": int(entry["detected"]),
             "missed": int(entry["missed"]),
@@ -695,7 +663,205 @@ def _fault_results(
             ),
             "groups": dict(entry["groups"]),
         }
+        if model == HYBRID_MODEL:
+            item["dominant_terms"] = dict(entry["dominant_terms"])
+            item["first_alarm_dominant"] = dict(entry["first_alarm_dominant"])
+        result[kind] = item
     return result
+
+
+def _hybrid_attribution(scores: pd.DataFrame, hybrid: pd.DataFrame) -> pd.DataFrame:
+    """Attribute a hybrid alarm to the larger weighted term's modality and group."""
+    dominant = hybrid["hybrid_dominant"].to_numpy()
+    physics_dominant = dominant == "physics"
+    return pd.DataFrame(
+        {
+            "hybrid_modality": np.where(
+                physics_dominant,
+                scores["physics_modality"].to_numpy(),
+                scores["baseline_pca_modality"].to_numpy(),
+            ),
+            "hybrid_group": np.where(physics_dominant, scores["physics_group"].to_numpy(), ""),
+            "hybrid_dominant": dominant,
+        },
+        index=scores.index,
+    )
+
+
+def _hybrid_candidates(
+    scores: pd.DataFrame,
+    physics_scored: pd.Series,
+    baseline_scored: pd.Series,
+    train_healthy: Sequence[str],
+) -> dict[float, pd.DataFrame]:
+    reference = scores["session_id"].isin(set(train_healthy))
+    result: dict[float, pd.DataFrame] = {}
+    for weight in HYBRID_WEIGHTS:
+        result[weight] = HybridScorer(weight).score(
+            scores["physics"],
+            scores["baseline_pca"],
+            reference=reference,
+            physics_scored=physics_scored,
+            baseline_scored=baseline_scored,
+        )
+    return result
+
+
+def _hybrid_detection(
+    scores: pd.DataFrame,
+    threshold: float,
+    session_ids: Sequence[str],
+    faults: Mapping[str, dict[str, object]],
+) -> tuple[int, float | None]:
+    """Detected validation fault sessions and their mean first-alarm delay."""
+    detected = 0
+    delays: list[int] = []
+    for session_id in session_ids:
+        truth = faults.get(session_id)
+        if truth is None:
+            continue
+        onset = int(truth["onset_ms"])
+        rows = scores.loc[scores["session_id"] == session_id].sort_values("start_ms")
+        rows = rows.loc[rows["start_ms"] >= onset]
+        scored = rows.loc[rows["hybrid"].notna()]
+        if scored.empty:
+            continue
+        alarm = scored.loc[scored["hybrid"].to_numpy(dtype=float) > threshold]
+        if alarm.empty:
+            continue
+        detected += 1
+        delays.append(int(alarm.iloc[0]["start_ms"]) - onset)
+    return detected, float(np.mean(delays)) if delays else None
+
+
+def _tune_hybrid(
+    candidates: Mapping[float, pd.DataFrame],
+    scores: pd.DataFrame,
+    val_healthy: Sequence[str],
+    val_ids: Sequence[str],
+    faults: Mapping[str, dict[str, object]],
+    target_false_alarms_per_hour: float,
+    stride_ms: int,
+) -> tuple[float, bool, list[dict[str, object]], float | None, str]:
+    """Pick a hybrid weight on validation sessions only; never reads the test split."""
+    val_faults = [session_id for session_id in val_ids if session_id in faults]
+    payload: list[dict[str, object]] = []
+    by_weight: dict[float, tuple[int, float | None, float | None]] = {}
+    for weight in HYBRID_WEIGHTS:
+        hybrid = candidates[weight]
+        validation = hybrid.loc[scores["session_id"].isin(set(val_healthy)), "hybrid"]
+        threshold: float | None = None
+        if np.isfinite(validation.to_numpy(dtype=float)).any():
+            threshold = _threshold(validation, target_false_alarms_per_hour, stride_ms)
+        detected = 0
+        mean_delay: float | None = None
+        if threshold is not None and val_faults:
+            tuning = pd.DataFrame(
+                {
+                    "session_id": scores["session_id"].to_numpy(),
+                    "start_ms": scores["start_ms"].to_numpy(),
+                    "hybrid": hybrid["hybrid"].to_numpy(),
+                }
+            )
+            detected, mean_delay = _hybrid_detection(tuning, threshold, val_faults, faults)
+        by_weight[weight] = (detected, mean_delay, threshold)
+        payload.append(
+            {
+                "weight": weight,
+                "threshold": threshold,
+                "detected_sessions": detected,
+                "mean_delay_ms": mean_delay,
+            }
+        )
+
+    if not val_faults:
+        threshold = by_weight[DEFAULT_HYBRID_WEIGHT][2]
+        return DEFAULT_HYBRID_WEIGHT, False, payload, threshold, "no validation fault session"
+    viable = [weight for weight in HYBRID_WEIGHTS if by_weight[weight][2] is not None]
+    if not viable:
+        return (
+            DEFAULT_HYBRID_WEIGHT,
+            False,
+            payload,
+            by_weight[DEFAULT_HYBRID_WEIGHT][2],
+            "no validation healthy hybrid score",
+        )
+
+    def rank(weight: float) -> tuple[float, float, float]:
+        detected, mean_delay, _ = by_weight[weight]
+        return (
+            -float(detected),
+            mean_delay if mean_delay is not None else math.inf,
+            -weight,
+        )
+
+    chosen = min(viable, key=rank)
+    return chosen, True, payload, by_weight[chosen][2], "validation fault sessions"
+
+
+def _unscored_by_part(mask: pd.Series, split: pd.Series) -> dict[str, int]:
+    parts = [part for part in SPLIT_PARTS if (split == part).any()]
+    return {str(part): int((mask & (split == part)).sum()) for part in parts}
+
+
+def _generalisation(
+    models: Mapping[str, Mapping[str, object]],
+    scores: pd.DataFrame,
+    thresholds: Mapping[str, float | None],
+    holdout_ids: Sequence[str],
+    holdout_healthy: Sequence[str],
+    faults: Mapping[str, dict[str, object]],
+    axis: str,
+    band: tuple[float, float],
+    proxy_role: str,
+    excluded: Sequence[str],
+) -> dict[str, object]:
+    """Compare every model on the in-distribution test split and the held-out band.
+
+    Thresholds are the ones fitted on validation healthy sessions above; the holdout is
+    never used to fit or recalibrate a model.
+    """
+    result: dict[str, dict[str, object]] = {}
+    for model, entry in models.items():
+        limit = math.nan if thresholds[model] is None else thresholds[model]
+        holdout = {
+            "false_alarms": _false_alarms(scores, model, limit, holdout_healthy),
+            "faults": _fault_results(scores, model, limit, holdout_ids, faults),
+        }
+        test = entry["test"]
+        test_faults = test["faults"]
+        delta: dict[str, object] = {
+            "false_alarms_per_hour": (
+                holdout["false_alarms"]["per_hour"] - test["false_alarms"]["per_hour"]
+            )
+        }
+        fault_delta: dict[str, dict[str, object]] = {}
+        for kind in sorted(set(holdout["faults"]) & set(test_faults)):
+            held = holdout["faults"][kind]
+            base = test_faults[kind]
+            held_delay = held["median_delay_ms"]
+            base_delay = base["median_delay_ms"]
+            fault_delta[kind] = {
+                "detected": held["detected"] - base["detected"],
+                "missed": held["missed"] - base["missed"],
+                "not_evaluated": held["not_evaluated"] - base["not_evaluated"],
+                "median_delay_ms": (
+                    None if held_delay is None or base_delay is None else held_delay - base_delay
+                ),
+            }
+        if fault_delta:
+            delta["faults"] = fault_delta
+        result[model] = {"test_holdout": holdout, "delta": delta}
+    return {
+        "axis": axis,
+        "band": [float(band[0]), float(band[1])],
+        "proxy_role": proxy_role,
+        "excluded_sessions": sorted(str(value) for value in excluded),
+        "holdout_sessions": list(holdout_ids),
+        "threshold_source": "validation healthy sessions (in-distribution)",
+        "models": result,
+        "note": SYNTHETIC_NOTE,
+    }
 
 
 def _counts(counter: Mapping[str, int]) -> str:
@@ -703,8 +869,11 @@ def _counts(counter: Mapping[str, int]) -> str:
 
 
 def _markdown(data: dict) -> str:
+    title = "# D-083 stage-1 evaluation"
+    if "hybrid" in data or "generalisation" in data:
+        title = "# D-083 stage-1/2 evaluation (synthetic)"
     lines = [
-        "# D-083 stage-1 evaluation",
+        title,
         "",
         f"- defs: {data['defs_version']}",
         f"- seed: {data['seed']}",
@@ -755,7 +924,7 @@ def _markdown(data: dict) -> str:
                 f"{', '.join(entry['missing_modalities'])} |"
             )
     lines += ["", "## Thresholds", "", "| model | threshold |", "|---|---|"]
-    for model in MODEL_NAMES:
+    for model in data["models"]:
         threshold = data["thresholds"][model]
         lines.append(f"| {model} | {NOT_CALIBRATED if threshold is None else f'{threshold:.6g}'} |")
     uncalibrated = data.get("not_calibrated", [])
@@ -785,7 +954,7 @@ def _markdown(data: dict) -> str:
         "| model | episodes | hours | per hour |",
         "|---|---|---|---|",
     ]
-    for model in MODEL_NAMES:
+    for model in data["models"]:
         alarm = data["models"][model]["test"]["false_alarms"]
         lines.append(
             f"| {model} | {alarm['episodes']:.0f} | {alarm['hours']:.4f} | "
@@ -805,7 +974,7 @@ def _markdown(data: dict) -> str:
             "| first alarm = expected | first alarm group |",
             "|---|---|---|---|---|---|---|---|---|---|---|",
         ]
-        for model in MODEL_NAMES:
+        for model in data["models"]:
             faults = data["models"][model]["test"]["faults"]
             if not faults:
                 lines.append(f"| {model} | (none) | - | 0 | 0 | 0 | - | - | - | - | - |")
@@ -824,6 +993,146 @@ def _markdown(data: dict) -> str:
                     f"{_counts(entry['first_alarm_modalities'])} | {match_text} | "
                     f"{_counts(entry['groups'])} |"
                 )
+
+    hybrid = data.get("hybrid")
+    if hybrid:
+        tuned = "tuned on validation" if hybrid["tuned"] else "not tuned"
+        lines += [
+            "",
+            "## Hybrid weighting (synthetic)",
+            "",
+            f"- weight: {hybrid['weight']} ({tuned}); grid: "
+            + ", ".join(f"{weight}" for weight in hybrid["grid"]),
+            "- w=0 is never allowed: the physics residual is always part of the score.",
+            f"- tuning rule: {hybrid['tuning_rule']}",
+            f"- tuning result: {hybrid['reason']}",
+            f"- physics-unscored windows: {_counts(hybrid['physics_unscored_windows'])}",
+            f"- hybrid-unscored windows: {_counts(hybrid['unscored_windows'])}",
+            "",
+            "| weight | threshold | validation detections | mean delay ms |",
+            "|---|---|---|---|",
+        ]
+        for candidate in hybrid["candidates"]:
+            threshold = candidate["threshold"]
+            delay = candidate["mean_delay_ms"]
+            lines.append(
+                f"| {candidate['weight']} | "
+                f"{NOT_CALIBRATED if threshold is None else f'{threshold:.6g}'} | "
+                f"{candidate['detected_sessions']} | "
+                f"{'-' if delay is None else f'{delay:.0f}'} |"
+            )
+
+    generalisation = data.get("generalisation")
+    if generalisation:
+        lines += [
+            "",
+            "## Generalisation (synthetic)",
+            "",
+            f"- axis: {generalisation['axis']}; band: "
+            f"[{generalisation['band'][0]:g}, {generalisation['band'][1]:g}]",
+            f"- axis proxy role: {generalisation['proxy_role']}",
+            f"- holdout sessions: {len(generalisation['holdout_sessions'])}",
+            f"- excluded sessions (no valid proxy): "
+            f"{', '.join(generalisation['excluded_sessions']) or '-'}",
+            "- thresholds are the validation-healthy ones; the holdout never refits them.",
+            "",
+            SYNTHETIC_NOTE + ".",
+            "",
+            "| model | test false alarms/h | holdout false alarms/h | delta |",
+            "|---|---|---|---|",
+        ]
+        for model in data["models"]:
+            test_alarm = data["models"][model]["test"]["false_alarms"]
+            held_alarm = generalisation["models"][model]["test_holdout"]["false_alarms"]
+            delta = generalisation["models"][model]["delta"]["false_alarms_per_hour"]
+            lines.append(
+                f"| {model} | {test_alarm['per_hour']:.3f} | "
+                f"{held_alarm['per_hour']:.3f} | {delta:+.3f} |"
+            )
+        lines += [
+            "",
+            "| model | fault kind | expected | test detected | test missed "
+            "| test not evaluated | test median delay ms | holdout detected | holdout missed "
+            "| holdout not evaluated | holdout median delay ms | holdout alarm windows "
+            "| holdout first alarm | holdout first alarm = expected | holdout first alarm group |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for model in data["models"]:
+            test_faults = data["models"][model]["test"]["faults"]
+            held_faults = generalisation["models"][model]["test_holdout"]["faults"]
+            kinds = sorted(set(test_faults) | set(held_faults))
+            if not kinds:
+                lines.append(
+                    f"| {model} | (none) | - | - | - | - | - | - | - | - | - | - | - | - | - |"
+                )
+                continue
+            for kind in kinds:
+                test = test_faults.get(kind, {})
+                held = held_faults.get(kind, {})
+                test_delay = test.get("median_delay_ms")
+                held_delay = held.get("median_delay_ms")
+                matches = held.get("first_alarm_matches_expected")
+                match_text = "-" if matches is None else f"{matches}/{held.get('detected', 0)}"
+                expected = (
+                    held.get("expected_modality") or test.get("expected_modality") or "unknown"
+                )
+                lines.append(
+                    f"| {model} | {kind} | {expected} | "
+                    f"{test.get('detected', 0)}/{test.get('sessions', 0)} | "
+                    f"{test.get('missed', 0)} | {test.get('not_evaluated', 0)} | "
+                    f"{'-' if test_delay is None else f'{test_delay:.0f}'} | "
+                    f"{held.get('detected', 0)}/{held.get('sessions', 0)} | "
+                    f"{held.get('missed', 0)} | {held.get('not_evaluated', 0)} | "
+                    f"{'-' if held_delay is None else f'{held_delay:.0f}'} | "
+                    f"{_counts(held.get('modalities', {}))} | "
+                    f"{_counts(held.get('first_alarm_modalities', {}))} | {match_text} | "
+                    f"{_counts(held.get('groups', {}))} |"
+                )
+        lines += [
+            "",
+            "| model | fault kind | delta detected | delta missed | delta not evaluated "
+            "| delta median delay ms |",
+            "|---|---|---|---|---|---|",
+        ]
+        for model in data["models"]:
+            deltas = generalisation["models"][model]["delta"].get("faults", {})
+            if not deltas:
+                lines.append(f"| {model} | (none) | - | - | - | - |")
+                continue
+            for kind, delta in deltas.items():
+                delay = delta["median_delay_ms"]
+                lines.append(
+                    f"| {model} | {kind} | {delta['detected']:+d} | {delta['missed']:+d} | "
+                    f"{delta['not_evaluated']:+d} | "
+                    f"{'-' if delay is None else f'{delay:+.0f}'} |"
+                )
+
+    if hybrid:
+        lines += [
+            "",
+            "## Hybrid term dominance",
+            "",
+            "| split | fault kind | alarm windows by dominant term | first alarm dominant |",
+            "|---|---|---|---|",
+        ]
+        for split_name, faults in (
+            ("test", data["models"][HYBRID_MODEL]["test"]["faults"]),
+            (
+                "test_holdout",
+                generalisation["models"][HYBRID_MODEL]["test_holdout"]["faults"]
+                if generalisation
+                else {},
+            ),
+        ):
+            if not faults:
+                lines.append(f"| {split_name} | (none) | - | - |")
+                continue
+            for kind, entry in faults.items():
+                lines.append(
+                    f"| {split_name} | {kind} | {_counts(entry['dominant_terms'])} | "
+                    f"{_counts(entry['first_alarm_dominant'])} |"
+                )
+
     lines.append("")
     return "\n".join(lines)
 
@@ -838,10 +1147,21 @@ def evaluate(
     window_ms: int = 10_000,
     stride_ms: int = 5_000,
     max_gap_ms: int = 500,
+    holdout_axis: str | None = None,
+    holdout_band: tuple[float, float] | None = None,
+    hybrid: bool = False,
 ) -> EvaluationResult:
-    """Run the stage-1 comparison and write ``evaluation.json`` and ``evaluation.md``."""
+    """Run the stage-1 comparison and write ``evaluation.json`` and ``evaluation.md``.
+
+    ``holdout_axis``/``holdout_band`` additionally hold out an operating-point band and
+    write the stage-2 generalisation section. ``hybrid`` adds the physics-weighted score
+    whose weight is tuned on validation sessions only. Without the new options the output
+    is unchanged.
+    """
     if window_ms <= 0 or stride_ms <= 0 or max_gap_ms <= 0:
         raise ValueError("window_ms, stride_ms and max_gap_ms must be positive")
+    if (holdout_axis is None) != (holdout_band is None):
+        raise ValueError("holdout_axis and holdout_band must be given together")
     data_path = Path(data_dir)
     out_path = Path(out_dir)
     roles = load_roles(config_path)
@@ -865,18 +1185,51 @@ def evaluate(
     frames: dict[str, pd.DataFrame | None] = {}
     missing_roles: dict[str, list[str]] = {}
     for session_id in all_ids:
-        frame, missing = _load_role_frame(store, session_id, roles, max_gap_ms)
+        frame, missing = load_role_frame(store, session_id, roles, max_gap_ms)
         frames[session_id] = frame
         if missing:
             missing_roles[session_id] = missing
 
+    excluded_sessions: list[str] = []
+    holdout_ids: list[str] = []
+    if holdout_axis is not None:
+        if holdout_axis not in roles.operating_point:
+            raise ValueError(
+                f"holdout axis {holdout_axis!r} is not in the role config [operating_point]"
+            )
+        if len(holdout_band) != 2:
+            raise ValueError("holdout_band must have exactly two edges")
+        points: dict[str, OperatingPoint] = session_operating_points(
+            store,
+            all_ids,
+            roles,
+            max_gap_ms=max_gap_ms,
+            frames=frames,
+        )
+        banded = split_by_band(
+            points,
+            holdout_axis,
+            holdout_band,
+            seed=seed,
+            healthy=set(_healthy(all_ids, faults)),
+        )
+        excluded_sessions = banded.pop("excluded")
+        result.split = banded
+        split_of = {session_id: part for part in SPLIT_PARTS for session_id in result.split[part]}
+        result.features["split"] = (
+            result.features["session_id"].astype(str).map(split_of).fillna("excluded")
+        )
+        holdout_ids = list(result.split["test_holdout"])
+
     table = _fit_gear_table(frames, roles, result.split["train"], faults)
     physics = _physics_features(result.features, frames, table, physics_feature_groups(roles))
+    physics_scored = physics[["cooling_ok", "charging_ok", "gearing_ok"]].sum(axis=1) > 0.0
     train_healthy = _healthy(result.split["train"], faults)
     physics_scores = _physics_scores(physics, result.features["session_id"].isin(train_healthy))
 
     baseline = _fit_baseline(result.features, result.split, train_healthy)
     baseline_scores = baseline.scores(result.features)
+    baseline_scored = baseline_scores["pca_error"].notna()
     excluded_features = [
         name
         for name in _numeric_feature_columns(result.features)
@@ -920,9 +1273,50 @@ def evaluate(
     scores["physics_modality"] = attribution["physics_modality"].to_numpy()
     scores["physics_group"] = attribution["physics_group"].to_numpy()
 
-    val_healthy = _healthy(result.split["val"], faults)
+    val_ids = result.split["val"]
+    val_healthy = _healthy(val_ids, faults)
+    reported_models = list(MODEL_NAMES)
+    hybrid_state: dict[str, object] | None = None
+    if hybrid:
+        candidates = _hybrid_candidates(scores, physics_scored, baseline_scored, train_healthy)
+        weight, tuned, tuning, hybrid_threshold, reason = _tune_hybrid(
+            candidates,
+            scores,
+            val_healthy,
+            val_ids,
+            faults,
+            target_false_alarms_per_hour,
+            stride_ms,
+        )
+        chosen = candidates[weight]
+        hybrid_attribution = _hybrid_attribution(scores, chosen)
+        scores["hybrid"] = chosen["hybrid"].to_numpy()
+        scores["hybrid_modality"] = hybrid_attribution["hybrid_modality"].to_numpy()
+        scores["hybrid_group"] = hybrid_attribution["hybrid_group"].to_numpy()
+        scores["hybrid_dominant"] = hybrid_attribution["hybrid_dominant"].to_numpy()
+        reported_models.append(HYBRID_MODEL)
+        hybrid_state = {
+            "weight": weight,
+            "grid": list(HYBRID_WEIGHTS),
+            "tuned": tuned,
+            "tuning_split": "val",
+            "tuning_rule": (
+                "most validation fault sessions; ties: smaller mean detection delay, then larger w"
+            ),
+            "reason": reason,
+            "candidates": tuning,
+            "threshold": hybrid_threshold,
+            "physics_unscored_windows": _unscored_by_part(
+                ~physics_scored, result.features["split"]
+            ),
+            "unscored_windows": _unscored_by_part(
+                chosen["hybrid"].isna(), result.features["split"]
+            ),
+            "note": SYNTHETIC_NOTE,
+        }
+
     thresholds: dict[str, float | None] = {}
-    for model in MODEL_NAMES:
+    for model in reported_models:
         validation = scores.loc[scores["session_id"].isin(val_healthy), model]
         if np.isfinite(validation.to_numpy(dtype=float)).any():
             thresholds[model] = _threshold(validation, target_false_alarms_per_hour, stride_ms)
@@ -934,7 +1328,7 @@ def evaluate(
     test_ids = result.split["test"]
     test_healthy = _healthy(test_ids, faults)
     models: dict[str, dict[str, object]] = {}
-    for model in MODEL_NAMES:
+    for model in reported_models:
         limit = math.nan if thresholds[model] is None else thresholds[model]
         models[model] = {
             "threshold": thresholds[model],
@@ -947,6 +1341,25 @@ def evaluate(
     fit_ids = set(result.split["train"]) | set(val_healthy)
     if fit_ids & set(test_ids):
         raise AssertionError("a test session leaked into fitting or threshold selection")
+    if fit_ids & set(holdout_ids):
+        raise AssertionError("a holdout session leaked into fitting or threshold selection")
+    if hybrid_state is not None:
+        hybrid_state["threshold"] = thresholds[HYBRID_MODEL]
+
+    generalisation: dict[str, object] | None = None
+    if holdout_axis is not None:
+        generalisation = _generalisation(
+            models,
+            scores,
+            thresholds,
+            holdout_ids,
+            _healthy(holdout_ids, faults),
+            faults,
+            holdout_axis,
+            (float(holdout_band[0]), float(holdout_band[1])),
+            roles.operating_point[holdout_axis],
+            excluded_sessions,
+        )
 
     data: dict[str, object] = {
         "defs_version": defs_version(),
@@ -960,7 +1373,7 @@ def evaluate(
         "threshold_sessions": val_healthy,
         "thresholds": thresholds,
         "pca_modality_training_mean_sq": pca_training_mean_sq,
-        "not_calibrated": [model for model in MODEL_NAMES if thresholds[model] is None],
+        "not_calibrated": [model for model in reported_models if thresholds[model] is None],
         "baseline_excluded_features": excluded_features,
         "baseline_excluded_modalities": excluded_modalities,
         "baseline_unscored": baseline_unscored,
@@ -969,6 +1382,10 @@ def evaluate(
         "missing_roles": missing_roles,
         "note": SYNTHETIC_NOTE,
     }
+    if hybrid_state is not None:
+        data["hybrid"] = hybrid_state
+    if generalisation is not None:
+        data["generalisation"] = generalisation
 
     out_path.mkdir(parents=True, exist_ok=True)
     json_path = out_path / "evaluation.json"
@@ -1017,6 +1434,30 @@ def _seed_metrics(data: Mapping[str, object]) -> dict[str, float]:
                 metrics[f"{prefix}.first_alarm_expected_rate"] = (
                     fault["first_alarm_matches_expected"] / evaluated
                 )
+    generalisation = data.get("generalisation")
+    if isinstance(generalisation, Mapping):
+        for model, entry in generalisation["models"].items():
+            held = entry["test_holdout"]
+            hours = held["false_alarms"].get("hours")
+            prefix = f"{model}.holdout"
+            if hours is None or hours > 0.0:
+                metrics[f"{prefix}.false_alarms_per_hour"] = float(held["false_alarms"]["per_hour"])
+            for kind, fault in held["faults"].items():
+                sessions = int(fault["sessions"])
+                not_evaluated = int(fault.get("not_evaluated", 0))
+                evaluated = sessions - not_evaluated
+                name = f"{prefix}.{kind}"
+                if evaluated:
+                    metrics[f"{name}.detection_rate"] = fault["detected"] / evaluated
+                metrics[f"{name}.not_evaluated_rate"] = (
+                    not_evaluated / sessions if sessions else 0.0
+                )
+                if fault["median_delay_ms"] is not None:
+                    metrics[f"{name}.median_delay_ms"] = float(fault["median_delay_ms"])
+                if fault["first_alarm_matches_expected"] is not None and evaluated:
+                    metrics[f"{name}.first_alarm_expected_rate"] = (
+                        fault["first_alarm_matches_expected"] / evaluated
+                    )
     return metrics
 
 
@@ -1191,7 +1632,10 @@ def evaluate_seeds(
     out_path = Path(out_dir)
     per_seed: dict[int, dict] = {}
     for seed in seeds:
-        result = evaluate(data_dir, out_path / f"seed-{seed}", config_path, seed=seed, **kwargs)
+        try:
+            result = evaluate(data_dir, out_path / f"seed-{seed}", config_path, seed=seed, **kwargs)
+        except ValueError as error:
+            raise ValueError(f"seed {seed}: {error}") from error
         per_seed[seed] = result.data
 
     data: dict[str, object] = {
