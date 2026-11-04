@@ -37,13 +37,37 @@ def _stage2_dataset(tmp_path: Path):
     return root, dataset
 
 
+def _canonical_json(text: str) -> str:
+    """Serialise JSON with floats rounded to 12 significant digits.
+
+    numpy/BLAS last-bit differences between macOS and the Linux CI change some float
+    spellings without changing an evaluation result. Everything except those last bits is
+    compared exactly: keys, strings, lists, integers and float text at 12 significant
+    digits.
+    """
+    payload = json.loads(text)
+
+    def normalise(value):
+        if isinstance(value, float):
+            return float(format(value, ".12g"))
+        if isinstance(value, dict):
+            return {key: normalise(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [normalise(item) for item in value]
+        return value
+
+    return json.dumps(normalise(payload), indent=2, sort_keys=True) + "\n"
+
+
 def test_default_evaluation_json_matches_the_stage1_fixture(tmp_path: Path) -> None:
     root = tmp_path / "data"
     dataset = make_physics_data_dir(root)
     dataset.write_faults(root / "faults.json")
 
     result = evaluate(root, tmp_path / "out", CONFIG)
-    assert result.json_path.read_text(encoding="utf-8") == FIXTURE.read_text(encoding="utf-8")
+    assert _canonical_json(result.json_path.read_text(encoding="utf-8")) == _canonical_json(
+        FIXTURE.read_text(encoding="utf-8")
+    )
 
 
 def test_holdout_hybrid_cli_end_to_end(tmp_path: Path) -> None:
