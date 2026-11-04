@@ -204,6 +204,120 @@ DEFAULT_PHYSICS_SESSIONS: tuple[PhysicsSessionSpec, ...] = (
 )
 
 
+# A stage-2 scenario spanning cold and warm operating points. The cold sessions have a
+# median coolant temperature inside the (30, 45) holdout band; the warm sessions lie
+# outside it. Faults are assigned so every split (train, val, test and test_holdout) has
+# a healthy session and one session of every CAN fault kind. The ids are chosen so the
+# seed-0 stable hash gives the intended val/test groups; the proxy values still come from
+# the generated recordings, never from this table.
+GENERALISATION_PHYSICS_SESSIONS: tuple[PhysicsSessionSpec, ...] = (
+    PhysicsSessionSpec(
+        "cold-00",
+        seed=100,
+        ambient_c=0.0,
+        load=0.35,
+        fault="thermostat_stuck_open",
+        onset_ms=30000,
+    ),
+    PhysicsSessionSpec(
+        "cold-01", seed=101, ambient_c=0.0, load=0.4, fault="fan_failure", onset_ms=30000
+    ),
+    PhysicsSessionSpec(
+        "cold-02", seed=102, ambient_c=1.0, load=0.35, fault="plateau_sag", onset_ms=30000
+    ),
+    PhysicsSessionSpec(
+        "cold-03", seed=103, ambient_c=2.0, load=0.3, fault="clutch_slip", onset_ms=30000
+    ),
+    PhysicsSessionSpec(
+        "cold-04", seed=104, ambient_c=2.0, load=0.35, fault="wheel_vibration", onset_ms=30000
+    ),
+    PhysicsSessionSpec("cold-05", seed=105, ambient_c=3.0, load=0.35),
+    PhysicsSessionSpec("cold-06", seed=106, ambient_c=4.0, load=0.3),
+    PhysicsSessionSpec("cold-07", seed=107, ambient_c=4.0, load=0.35),
+    PhysicsSessionSpec("cold-08", seed=108, ambient_c=5.0, load=0.3),
+    PhysicsSessionSpec("cold-09", seed=109, ambient_c=5.0, load=0.35),
+    PhysicsSessionSpec("cold-10", seed=110, ambient_c=6.0, load=0.3),
+    PhysicsSessionSpec("cold-11", seed=111, ambient_c=6.0, load=0.35),
+    PhysicsSessionSpec(
+        "warm-000",
+        seed=200,
+        ambient_c=15.0,
+        load=0.6,
+        fault="thermostat_stuck_open",
+        onset_ms=30000,
+    ),
+    PhysicsSessionSpec(
+        "warm-002", seed=201, ambient_c=15.0, load=0.9, fault="fan_failure", onset_ms=30000
+    ),
+    PhysicsSessionSpec(
+        "warm-005", seed=202, ambient_c=15.0, load=1.2, fault="plateau_sag", onset_ms=30000
+    ),
+    PhysicsSessionSpec(
+        "warm-006", seed=203, ambient_c=20.0, load=0.6, fault="clutch_slip", onset_ms=30000
+    ),
+    PhysicsSessionSpec(
+        "warm-007", seed=204, ambient_c=20.0, load=0.9, fault="wheel_vibration", onset_ms=30000
+    ),
+    PhysicsSessionSpec(
+        "warm-009", seed=205, ambient_c=20.0, load=1.2, fault="wheel_vibration", onset_ms=30000
+    ),
+    PhysicsSessionSpec(
+        "warm-010", seed=206, ambient_c=25.0, load=0.6, fault="wheel_vibration", onset_ms=30000
+    ),
+    PhysicsSessionSpec(
+        "warm-011", seed=207, ambient_c=25.0, load=0.9, fault="wheel_vibration", onset_ms=30000
+    ),
+    PhysicsSessionSpec("warm-012", seed=208, ambient_c=25.0, load=1.2),
+    PhysicsSessionSpec("warm-013", seed=209, ambient_c=30.0, load=0.6),
+    PhysicsSessionSpec("warm-014", seed=210, ambient_c=30.0, load=0.9),
+    PhysicsSessionSpec("warm-016", seed=211, ambient_c=30.0, load=1.2),
+    PhysicsSessionSpec("warm-017", seed=212, ambient_c=35.0, load=0.6),
+    PhysicsSessionSpec("warm-019", seed=213, ambient_c=35.0, load=0.9),
+    PhysicsSessionSpec("warm-020", seed=214, ambient_c=35.0, load=1.2),
+    PhysicsSessionSpec("warm-021", seed=215, ambient_c=40.0, load=0.6),
+    PhysicsSessionSpec("warm-025", seed=216, ambient_c=40.0, load=0.9),
+    PhysicsSessionSpec("warm-026", seed=217, ambient_c=40.0, load=1.2),
+    PhysicsSessionSpec("warm-027", seed=218, ambient_c=15.0, load=0.6),
+    PhysicsSessionSpec("warm-028", seed=219, ambient_c=15.0, load=0.9),
+    PhysicsSessionSpec(
+        "warm-001",
+        seed=220,
+        ambient_c=15.0,
+        load=1.2,
+        fault="thermostat_stuck_open",
+        onset_ms=30000,
+    ),
+    PhysicsSessionSpec(
+        "warm-004", seed=221, ambient_c=20.0, load=0.6, fault="fan_failure", onset_ms=30000
+    ),
+    PhysicsSessionSpec(
+        "warm-008", seed=222, ambient_c=20.0, load=0.9, fault="plateau_sag", onset_ms=30000
+    ),
+    PhysicsSessionSpec(
+        "warm-018", seed=223, ambient_c=20.0, load=1.2, fault="clutch_slip", onset_ms=30000
+    ),
+    PhysicsSessionSpec("warm-024", seed=224, ambient_c=25.0, load=0.6),
+    PhysicsSessionSpec(
+        "warm-003",
+        seed=225,
+        ambient_c=25.0,
+        load=0.9,
+        fault="thermostat_stuck_open",
+        onset_ms=30000,
+    ),
+    PhysicsSessionSpec(
+        "warm-015", seed=226, ambient_c=25.0, load=1.2, fault="fan_failure", onset_ms=30000
+    ),
+    PhysicsSessionSpec(
+        "warm-022", seed=227, ambient_c=30.0, load=0.6, fault="plateau_sag", onset_ms=30000
+    ),
+    PhysicsSessionSpec(
+        "warm-023", seed=228, ambient_c=30.0, load=0.9, fault="clutch_slip", onset_ms=30000
+    ),
+    PhysicsSessionSpec("warm-030", seed=229, ambient_c=30.0, load=1.2),
+)
+
+
 def _times(duration_ms: int) -> np.ndarray:
     return np.arange(0, duration_ms + 1, STEP_MS, dtype=np.int64)
 
@@ -483,6 +597,11 @@ def make_physics_data_dir(
         )
         sessions.append(session)
     return PhysicsDataset(root, tuple(sessions))
+
+
+def make_generalisation_data_dir(root: Path) -> PhysicsDataset:
+    """Create the stage-2 synthetic dataset with cold (holdout) and warm sessions."""
+    return make_physics_data_dir(root, GENERALISATION_PHYSICS_SESSIONS)
 
 
 def healthy_variant(spec: PhysicsSessionSpec) -> PhysicsSessionSpec:
