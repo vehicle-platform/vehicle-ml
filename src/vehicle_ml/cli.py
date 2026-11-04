@@ -35,6 +35,20 @@ def _parse_bands(text: str | None) -> dict[str, list[tuple[float, float]]]:
     return bands
 
 
+def _parse_holdout(text: str | None) -> tuple[str | None, tuple[float, float] | None]:
+    if text is None:
+        return None, None
+    parts = text.split(":")
+    if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2]:
+        raise ValueError(f"invalid holdout {text!r}; expected axis:LOW:HIGH")
+    axis, low, high = parts
+    try:
+        band = (float(low), float(high))
+    except ValueError:
+        raise ValueError(f"invalid holdout {text!r}; LOW and HIGH must be numbers") from None
+    return axis, band
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vehicle-ml")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -73,6 +87,17 @@ def _parser() -> argparse.ArgumentParser:
     evaluation.add_argument("--window-ms", type=int, default=10_000)
     evaluation.add_argument("--stride-ms", type=int, default=5_000)
     evaluation.add_argument("--max-gap-ms", type=int, default=500)
+    evaluation.add_argument(
+        "--holdout",
+        default=None,
+        metavar="AXIS:LOW:HIGH",
+        help="hold out an operating-point band, e.g. temperature:30:45",
+    )
+    evaluation.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="add the physics-weighted hybrid score (tuned on validation only)",
+    )
     return parser
 
 
@@ -81,11 +106,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "evaluate":
         try:
+            holdout_axis, holdout_band = _parse_holdout(args.holdout)
             options = {
                 "target_false_alarms_per_hour": args.target_false_alarms_per_hour,
                 "window_ms": args.window_ms,
                 "stride_ms": args.stride_ms,
                 "max_gap_ms": args.max_gap_ms,
+                "holdout_axis": holdout_axis,
+                "holdout_band": holdout_band,
+                "hybrid": args.hybrid,
             }
             if args.seeds is not None:
                 seeds = parse_seeds(args.seeds)

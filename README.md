@@ -4,7 +4,7 @@ Part of [vehicle-platform](https://github.com/vehicle-platform), an SDV-style di
 
 Offline model **training** (Python): context classification (first model: road type/surface/riding event), the combined anomaly model (early fusion: CAN + vibration + acoustic + thermal + context), rider identity/style/fatigue (Phase 2). Outputs are **exported** in the format appropriate for the target node: TFLite Micro or ESP-DL (for MCUs), ONNX/TFLite (for the Raspi).
 
-**Status:** the offline data layer (session store, session split, windows, features, normalisation and the dataset CLI) and the D-083 stage-1 classical physics estimators are implemented; no neural model is trained yet.
+**Status:** the offline data layer (session store, session split, windows, features, normalisation and the dataset CLI), the D-083 stage-1 classical physics estimators and the stage-2 synthetic evaluation (operating-point holdout and physics-weighted hybrid) are implemented. Stage 2 on real rides and HIL fault injection is still to come; no neural model is trained yet.
 
 ## Data layer
 
@@ -184,6 +184,88 @@ current and 1 kHz voltage) and air/fuel trims (trim DIDs are not verified, D-068
 
 **No safety use:** these detectors are offline evidence only. Nothing here outputs to a
 node, and no threshold here may loosen a safety ceiling (invariant 3).
+
+## Stage 2 (D-083, synthetic)
+
+Stage 2 adds an operating-point holdout and a physics-weighted hybrid score. It is still
+evaluated only on synthetic sessions; no number here is evidence for a real ride, and
+nothing feeds a vehicle node.
+
+### Operating-point proxies
+
+The role map has no ambient-temperature signal and the vehicle has no direct load signal
+in the roles. The holdout therefore uses two **proxies** taken from the recorded session
+itself: median coolant temperature for ambient temperature, and median engine speed for
+load. The optional `[operating_point]` table in `configs/physics_cl250.toml` maps the axes
+to those existing roles; `session_operating_points` reports the median and valid sample
+count per session, and leaves an axis `None` when the session has no valid sample. It
+never reads `faults.json` or the synthetic spec. A session with `None` on the holdout axis
+is excluded and listed in the report.
+
+### Holdout split and generalisation report
+
+`split_by_band` puts every session with a proxy value inside the closed band into
+`test_holdout` and splits the remaining sessions into train/val/test with the same stable
+hash as `split_sessions`. Train and val never contain a session from the band; the code
+refuses an empty holdout, or a train/val part without healthy sessions. `--seeds` keeps
+the holdout membership fixed and changes only the remaining split.
+
+Thresholds are always fitted on validation healthy sessions, never on the holdout. With
+`--holdout AXIS:LOW:HIGH`, `evaluation.json` gains a `generalisation` object and
+`evaluation.md` a *Generalisation (synthetic)* section: per model false alarms per hour,
+detection delay, misses and modality are reported for the in-distribution `test` part and
+for `test_holdout`, with deltas between the reported numbers. Neither the fit nor the
+threshold uses holdout data.
+
+### Physics-weighted hybrid
+
+Per window, `hybrid = w * physics_score + (1 - w) * baseline_pca_score`. Each score is
+normalised by its train-healthy median/MAD before mixing, so the two are on one robust
+scale. The fixed grid is `(0.25, 0.5, 0.75, 1.0)`; **`w = 0` is never allowed** because
+the physics residual must always be part of the score. Tuning uses the validation split
+only: for each candidate it thresholds at the target validation false-alarm rate, then
+picks the weight with the most detected validation fault sessions; ties go to the smaller
+mean detection delay, then the larger `w`. If validation has no fault session the report
+uses `w = 0.5` and marks it `not tuned`. A window the physics model did not score stays
+unscored for the hybrid too (never baseline-only), and the report counts those windows.
+When the physics weighted term dominates an alarm, its modality is the physics group's;
+otherwise the baseline attribution is used, and the dominant term is reported per alarm.
+The hybrid model and its section appear only when `--hybrid` is given; the default output
+is unchanged.
+
+```sh
+uv run vehicle-ml evaluate \
+  --data-dir /path/to/vehicle-server/data \
+  --out ./out/eval-holdout \
+  --config configs/physics_cl250.toml \
+  --holdout temperature:30:45 \
+  --hybrid
+```
+
+Add `--seeds 0,1,2` to repeat the evaluation with the same holdout and aggregate the
+per-seed metrics. Stage 2 on real rides and HIL fault injection is still to come; it needs
+ride data and the HIL bench, and it does not change any safety threshold.
+
+### Limitations of the synthetic stage 2
+
+- **The temperature proxy is not ambient temperature.** Median coolant temperature rises
+  with load, so a coolant band also selects a load range. The synthetic scenario adds
+  low-load warm sessions to train/val/test so the cold holdout differs in temperature only;
+  without them the physics charging model was scored below its training RPM range and
+  every cold "detection" came from the charging group. A real-ride holdout needs the same
+  check: compare the load proxy of the holdout with the training range before reading the
+  report.
+- **Cooling faults move the proxy.** `fan_failure` and `thermostat_stuck_open` change the
+  coolant temperature, so a faulty session can enter or leave a temperature band because of
+  its fault.
+- **Holdout detections are only meaningful next to the holdout false-alarm rate.** When a
+  model alarms often on healthy holdout sessions, an alarm after the onset of a fault
+  session counts as a detection even if it has nothing to do with the fault. Read
+  `detected` together with `false_alarms.per_hour` of the same part.
+- On the synthetic cold holdout the physics model does not generalise better than the
+  baseline: its cooling group alarms on healthy cold sessions, whose coolant temperatures
+  the warm-only fit has never seen. This is reported, not tuned away; no generalisation
+  claim follows from it (methodology rule 4).
 
 ## Build
 

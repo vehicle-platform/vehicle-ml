@@ -15,3 +15,9 @@ gearbox_ratio_measured = "derived.gearbox_ratio_measured"
 cooling = "cooling"
 charging = "charging"
 gearing = "longitudinal"
+
+# Operating-point proxies for the stage-2 holdout split. These are existing roles,
+# never defs signal literals in library code; the values are medians of recorded data.
+[operating_point]
+temperature = "coolant_temp"
+load = "engine_speed"
